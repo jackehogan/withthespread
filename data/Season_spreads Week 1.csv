@@ -1,0 +1,33 @@
+,Week 1 spread,Week 1 Opponent,Week 1 score,Week 1 diff,Week 1 spreadscore,Week 2 spread,Week 2 spread,Week 2 coverprob,Week 2 predspread,Week 2 Opponent,Week 2 coverprob_diff,Week 2 predspread_diff,Week 2 Opponent,Week 2 Order
+Arizona Cardinals,7,Washington Commanders,16,-4,3,10.5,10.5,0.5266581,0.14908272,New York Giants,0.013880134,0.050128989,New York Giants,10
+Atlanta Falcons,-3.5,Carolina Panthers,24,14,10.5,5.5,5.5,0.48379156,-4.5398464,Green Bay Packers,0.025524199,-6.92144084,Green Bay Packers,1
+Baltimore Ravens,-9.5,Houston Texans,25,16,6.5,-8.5,-8.5,0.50053674,-4.365124,Cincinnati Bengals,-0.093996108,1.323624611,Cincinnati Bengals,3
+Buffalo Bills,-2.5,New York Jets,16,-6,-8.5,-5.5,-5.5,0.49941933,2.5626204,Las Vegas Raiders,-0.011538625,4.849786043,Las Vegas Raiders,2
+Carolina Panthers,3.5,Atlanta Falcons,10,-14,-10.5,4,4,0.5316942,0.2631465,New Orleans Saints,-0.066439986,5.192411512,New Orleans Saints,14
+Chicago Bears,-1.5,Green Bay Packers,20,-18,-19.5,11.5,11.5,0.59453285,-7.5787063,Tampa Bay Buccaneers,0.103737682,-15.45988846,Tampa Bay Buccaneers,6
+Cincinnati Bengals,-2,Cleveland Browns,3,-21,-23,-7.5,-7.5,0.59453285,-5.688749,Baltimore Ravens,0.093996108,-1.323624611,Baltimore Ravens,3
+Cleveland Browns,2,Cincinnati Bengals,24,21,23,-4.5,-4.5,0.45826736,2.221873,Pittsburgh Steelers,-0.105791122,7.095149279,Pittsburgh Steelers,15
+Dallas Cowboys,-3,New York Giants,40,40,37,-10.5,-10.5,0.5169956,-1.6593721,New York Jets,0.042969346,5.756337881,New York Jets,11
+Denver Broncos,-3,Las Vegas Raiders,16,-1,-4,5.5,5.5,0.6379734,5.8627305,Washington Commanders,0.050261438,10.00412893,Washington Commanders,12
+Detroit Lions,4,Kansas City Chiefs,21,1,5,-5.5,-5.5,0.51095796,-4.9223504,Seattle Seahawks,-0.053100526,-7.487214327,Seattle Seahawks,4
+Green Bay Packers,1.5,Chicago Bears,38,18,19.5,-1,-1,0.45826736,2.3815944,Atlanta Falcons,-0.025524199,6.92144084,Atlanta Falcons,1
+Houston Texans,9.5,Baltimore Ravens,9,-16,-6.5,7,7,0.6314295,-1.0498883,Indianapolis Colts,0,2.074792266,Indianapolis Colts,8
+Indianapolis Colts,4.5,Jacksonville Jaguars,21,-10,-5.5,8.5,8.5,0.6314295,-3.1246805,Houston Texans,0,-2.074792266,Houston Texans,8
+Jacksonville Jaguars,-4.5,Indianapolis Colts,31,10,5.5,-7,-7,0.51095796,-1.7138896,Kansas City Chiefs,-0.149939775,6.277846336,Kansas City Chiefs,7
+Kansas City Chiefs,-4,Detroit Lions,20,-1,-5,-11.5,-11.5,0.66089773,-7.991736,Jacksonville Jaguars,0.149939775,-6.277846336,Jacksonville Jaguars,7
+Las Vegas Raiders,3,Denver Broncos,17,1,4,1.5,1.5,0.51095796,-2.2871656,Buffalo Bills,0.011538625,-4.849786043,Buffalo Bills,2
+Los Angeles Chargers,-3,Miami Dolphins,34,-2,-5,-1.5,-1.5,0.66089773,-5.080024,Tennessee Titans,0.115370035,1.456337929,Tennessee Titans,5
+Los Angeles Rams,4.5,Seattle Seahawks,30,17,21.5,7.5,7.5,0.45826736,-3.2521782,San Francisco 49ers,-0.013134211,1.324454308,San Francisco 49ers,9
+Miami Dolphins,3,Los Angeles Chargers,36,2,5,-5.5,-5.5,0.51095796,-5.698251,New England Patriots,-0.087176204,-11.06986666,New England Patriots,13
+Minnesota Vikings,-4.5,Tampa Bay Buccaneers,17,-3,-7.5,1.5,1.5,0.55883926,-3.2314384,Philadelphia Eagles,0.020097375,1.340545893,Philadelphia Eagles,0
+New England Patriots,3.5,Philadelphia Eagles,20,-5,-1.5,-2,-2,0.59813416,5.371616,Miami Dolphins,0.087176204,11.06986666,Miami Dolphins,13
+New Orleans Saints,-3,Tennessee Titans,16,1,-2,1,1,0.59813416,-4.929265,Carolina Panthers,0.066439986,-5.192411512,Carolina Panthers,14
+New York Giants,2.5,Dallas Cowboys,0,-40,-37.5,9.5,9.5,0.512778,0.09895373,Arizona Cardinals,-0.013880134,-0.050128989,Arizona Cardinals,10
+New York Jets,3,Buffalo Bills,22,6,9,2,2,0.47402626,-7.41571,Dallas Cowboys,-0.042969346,-5.756337881,Dallas Cowboys,11
+Philadelphia Eagles,-3.5,New England Patriots,25,5,1.5,-7,-7,0.5387419,-4.5719843,Minnesota Vikings,-0.020097375,-1.340545893,Minnesota Vikings,0
+Pittsburgh Steelers,2,San Francisco 49ers,7,-23,-21,-1.5,-1.5,0.5640585,-4.873276,Cleveland Browns,0.105791122,-7.095149279,Cleveland Browns,15
+San Francisco 49ers,-2,Pittsburgh Steelers,30,23,21,-9.5,-9.5,0.47140157,-4.5766325,Los Angeles Rams,0.013134211,-1.324454308,Los Angeles Rams,9
+Seattle Seahawks,-4.5,Los Angeles Rams,13,-17,-21.5,-4,-4,0.5640585,2.564864,Detroit Lions,0.053100526,7.487214327,Detroit Lions,4
+Tampa Bay Buccaneers,4.5,Minnesota Vikings,20,3,7.5,7,7,0.49079517,7.881182,Chicago Bears,-0.103737682,15.45988846,Chicago Bears,6
+Tennessee Titans,3,New Orleans Saints,15,-1,2,4.5,4.5,0.5455277,-6.5363617,Los Angeles Chargers,-0.115370035,-1.456337929,Los Angeles Chargers,5
+Washington Commanders,-7,Arizona Cardinals,20,4,-3,5.5,5.5,0.587712,-4.1413984,Denver Broncos,-0.050261438,-10.00412893,Denver Broncos,12

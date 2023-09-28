@@ -1,0 +1,33 @@
+Team,Year,Week,1,coverprob,predspread
+Arizona Cardinals,2023,2,3.0,0.5266581,0.14908272
+Atlanta Falcons,2023,2,10.5,0.48379156,-4.5398464
+Baltimore Ravens,2023,2,6.5,0.50053674,-4.365124
+Buffalo Bills,2023,2,-8.5,0.49941933,2.5626204
+Carolina Panthers,2023,2,-10.5,0.5316942,0.2631465
+Chicago Bears,2023,2,-19.5,0.59453285,-7.5787063
+Cincinnati Bengals,2023,2,-23.0,0.59453285,-5.688749
+Cleveland Browns,2023,2,23.0,0.45826736,2.221873
+Dallas Cowboys,2023,2,37.0,0.5169956,-1.6593721
+Denver Broncos,2023,2,-4.0,0.6379734,5.8627305
+Detroit Lions,2023,2,5.0,0.51095796,-4.9223504
+Green Bay Packers,2023,2,19.5,0.45826736,2.3815944
+Houston Texans,2023,2,-6.5,0.6314295,-1.0498883
+Indianapolis Colts,2023,2,-5.5,0.6314295,-3.1246805
+Jacksonville Jaguars,2023,2,5.5,0.51095796,-1.7138896
+Kansas City Chiefs,2023,2,-5.0,0.66089773,-7.991736
+Las Vegas Raiders,2023,2,4.0,0.51095796,-2.2871656
+Los Angeles Chargers,2023,2,-5.0,0.66089773,-5.080024
+Los Angeles Rams,2023,2,21.5,0.45826736,-3.2521782
+Miami Dolphins,2023,2,5.0,0.51095796,-5.698251
+Minnesota Vikings,2023,2,-7.5,0.55883926,-3.2314384
+New England Patriots,2023,2,-1.5,0.59813416,5.371616
+New Orleans Saints,2023,2,-2.0,0.59813416,-4.929265
+New York Giants,2023,2,-37.5,0.512778,0.09895373
+New York Jets,2023,2,9.0,0.47402626,-7.41571
+Philadelphia Eagles,2023,2,1.5,0.5387419,-4.5719843
+Pittsburgh Steelers,2023,2,-21.0,0.5640585,-4.873276
+San Francisco 49ers,2023,2,21.0,0.47140157,-4.5766325
+Seattle Seahawks,2023,2,-21.5,0.5640585,2.564864
+Tampa Bay Buccaneers,2023,2,7.5,0.49079517,7.881182
+Tennessee Titans,2023,2,2.0,0.5455277,-6.5363617
+Washington Commanders,2023,2,-3.0,0.587712,-4.1413984
