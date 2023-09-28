@@ -3,6 +3,8 @@
 ## Predict NFL spreads based on past weeks performance against the spread
 ### Routine runs weekly
 
+Run: WeeklySpreadPred.py
+
 Routine Description
 1. past weeks game results are pulled with NFL API and compared with the previous weeks predicitons
 2.Model (currently XGBoost) is trained on NFL season data from 2000+ 
