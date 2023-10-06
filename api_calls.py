@@ -8,6 +8,7 @@ def read_json(folder,file_name):
     with open(folder+'/'+file_name+'.txt') as i:
         return json.load(i)
 def mongoConn():
+    from pymongo.mongo_client import MongoClient
     config = read_json('data','config')
     USERNAME = config['mongo']['username']
     PW = config['mongo']['pw']
@@ -135,3 +136,76 @@ def extractNextWeeksSpreads(spreaddata, weeks_num):
                                           pd.Series(opponent, name='opponent')
                                           ], axis=1)
     return dfseasonspreads_nextweek
+
+def delete_documents(client, mongo_db, mongo_collection, field_to_match, value_to_match):
+    """
+    Delete documents from a MongoDB collection that match a certain value.
+
+    Parameters
+    ----------
+    mongo_db : str
+        Name of the MongoDB database.
+    mongo_collection : str
+        Name of the MongoDB collection.
+    value_to_match : int or str
+        Value to match for deletion.
+
+    Returns
+    -------
+    None.
+    """
+
+    # Connect to the database and collection
+    database = client[mongo_db]
+    collection = database[mongo_collection]
+
+
+    # Create a query to find documents matching the value
+    query = {field_to_match: value_to_match}  # Replace 'field_name_to_match' with your actual field name
+
+    # Delete documents that match the query
+    result = collection.delete_many(query)
+
+    # Print the number of deleted documents
+    print(f"Deleted {result.deleted_count} documents that matched the value.")
+
+def update_document(client, mongo_db, mongo_collection, week, fields_to_update,df):
+    """
+    Update a document in a MongoDB collection.
+
+    Parameters
+    ----------
+    client : pymongo.MongoClient
+        A MongoClient instance connected to MongoDB.
+    mongo_db : str
+        Name of the MongoDB database.
+    mongo_collection : str
+        Name of the MongoDB collection.
+    filter_query : dict
+        A MongoDB filter query.
+    update_query : dict
+        A MongoDB update query.
+
+    Returns
+    -------
+    None.
+    """
+
+    # Connect to the database and collection
+    database = client[mongo_db]
+    collection = database[mongo_collection]
+
+    df_forUpdate = df[df['Week']==week]
+
+
+    # Update the document
+    for field in fields_to_update:
+        for index, row in df_forUpdate.iterrows():
+            filter_query = {"Week": row["Week"],'Team':row['Team']}  # Replace "field_name" with the actual identifier
+            old_value = collection.find_one(filter_query)[field]
+            update_query = {"$set": {field: row[field]}}  # Update other fields as needed
+            result = collection.update_one(filter_query, update_query)
+            new_value = collection.find_one(filter_query)[field]
+            print(f"Updated week: {week}, team: {row['Team']} {field} from {old_value} to {new_value}.")
+    # Print success message
+    print("Updated document in the collection.")

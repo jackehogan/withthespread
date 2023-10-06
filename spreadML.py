@@ -90,11 +90,11 @@ def fitxgbModel(modeltype,X_train, y_train):
         y_encoded = LabelEncoder().fit_transform(np.sign(y_train))
         # model = XGBRegressor(**params,enable_categorical=True,tree_method="hist")
         if modeltype=='clas':
-            cvscore = cross_val_score(model, X_train, y_encoded, cv=5)
+            cvscore = -cross_val_score(model, X_train, y_encoded, cv=5, scoring='accuracy')
         else:
-            cvscore = cross_val_score(model, X_train, y_train, cv=5)
+            cvscore = -cross_val_score(model, X_train, y_train, cv=5, scoring='neg_mean_squared_error')
 
-        return 1-cvscore.mean()  # Hyperopt minimizes the objective, so we use negative accuracy
+        return cvscore.mean()  # Hyperopt minimizes the objective, so we use negative accuracy
 
     # Define the search space for hyperparameters
     space = {

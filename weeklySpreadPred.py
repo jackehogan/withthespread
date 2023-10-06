@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import datetime
-from api_calls import mongoConn,get_db,add_to_db,getLastWeeksResults,extractLastWeeksResults,extractNextWeeksSpreads,getNextWeeksSpreads
+from api_calls import mongoConn,get_db,add_to_db,getLastWeeksResults,extractLastWeeksResults,extractNextWeeksSpreads,getNextWeeksSpreads,update_document
 from spreadML import genData,fitxgbModel
 from xgboost import XGBRegressor,XGBClassifier
 
@@ -10,6 +10,11 @@ client = mongoConn()
 dfbets = get_db(client,'withTheSpread','bets')
 dfseasonspreads = get_db(client,'withTheSpread','season_spreads')
 dfseasonspreads = dfseasonspreads.set_index(['Team'],drop=True).drop(['_id'],axis=1)
+
+breakpoint()
+dfseasonspreads_mistake = pd.read_csv('data/Season_spreads week4.csv',index_col=[0])
+dfseasonspreads = pd.concat([dfseasonspreads,dfseasonspreads_mistake])
+breakpoint()
 
 ### Get last week's results
 data = getLastWeeksResults()
@@ -20,10 +25,13 @@ dfseasonspreads_lastweek['spreadscore'] = dfseasonspreads_lastweek['diff'] + dfs
 print(dfseasonspreads_lastweek)
 
 ### update seasonspreads with last week's results
-dfseasonspreads.loc[dfseasonspreads_lastweek['Week']==weeks_num[-1],'score'] = dfseasonspreads_lastweek['score']
-dfseasonspreads.loc[dfseasonspreads_lastweek['Week']==weeks_num[-1],'diff'] = dfseasonspreads_lastweek['diff']
-dfseasonspreads.loc[dfseasonspreads_lastweek['Week']==weeks_num[-1],'spreadscore'] = dfseasonspreads_lastweek['spreadscore']
-dfseasonspreads
+#### must check this step!!!!!!!!!!!!!
+dfseasonspreads.loc[dfseasonspreads['Week']==weeks_num[-1],'score'] = dfseasonspreads_lastweek['score']
+dfseasonspreads.loc[dfseasonspreads['Week']==weeks_num[-1],'diff'] = dfseasonspreads_lastweek['diff']
+dfseasonspreads.loc[dfseasonspreads['Week']==weeks_num[-1],'spreadscore'] = dfseasonspreads_lastweek['spreadscore']
+
+#alternatively could use this below
+# dfseasonspreads.loc[dfseasonspreads['Week']==weeks_num[-1],['score','diff','spreadscore']].update(dfseasonspreads_lastweek[['score','diff','spreadscore']]
 
 ### get next week's spreads
 spreaddata = getNextWeeksSpreads()
@@ -68,8 +76,8 @@ dfseasonspreads_temp = pd.concat([X.set_index('Team'),
            pd.DataFrame(clas.predict_proba(X),index=X['Team']).iloc[:,1].rename('coverprob'),
            pd.Series(reg.predict(X),index=X['Team'],name='predspread')],axis=1)
 dfseasonspreads_temp = dfseasonspreads_temp[['Year','Week','coverprob','predspread']].join(dfseasonspreads_nextweek)
-dfseasonspreads_temp['coverprob_diff'] = dfseasonspreads_temp.apply(lambda row: row['coverprob'] - dfseasonspreads_temp.loc[row['opponent']]['coverprob'],axis=1)
-dfseasonspreads_temp['predspread_diff'] = dfseasonspreads_temp.apply(lambda row: row['predspread'] - dfseasonspreads_temp.loc[row['opponent']]['predspread'],axis=1)
+dfseasonspreads_temp['coverprob_diff'] = dfseasonspreads_temp.apply(lambda row: np.nan if pd.isnull(row['opponent']) else row['coverprob'] - dfseasonspreads_temp.loc[row['opponent']]['coverprob'],axis=1)
+dfseasonspreads_temp['predspread_diff'] = dfseasonspreads_temp.apply(lambda row: np.nan if pd.isnull(row['opponent']) else row['predspread'] - dfseasonspreads_temp.loc[row['opponent']]['predspread'],axis=1)
 
 breakpoint()
 #### happy with spread routine outcome? Next steps will save to mongoDB and csv
@@ -79,5 +87,9 @@ dfseasonspreads_new = pd.concat([dfseasonspreads,dfseasonspreads_temp])
 dfseasonspreads_new.to_csv('data/Season_spreads.csv')
 dfseasonspreads_temp.to_csv(f'data/Season_spreads {nextweekstr}.csv')
 
+breakpoint()
+## check to make sure following steps update last weeks data correctly
+dfupdate = dfseasonspreads_temp[dfseasonspreads_temp['Week']==weeks_num[-1]]
+update_document(client,'withTheSpread','season_spreads',weeks_num[-1],['score','diff','spreadscore'],dfseasonspreads_new)
 add_to_db(client,'withTheSpread','season_spreads',dfseasonspreads_temp)
 client.close()
