@@ -159,6 +159,11 @@ def delete_documents(client, mongo_db, mongo_collection, field_to_match, value_t
     database = client[mongo_db]
     collection = database[mongo_collection]
 
+    if field_to_match=='All' and value_to_match=='All':
+        collection.delete_many({})
+        print(f"Deleted all documents in the collection.")
+        return
+
 
     # Create a query to find documents matching the value
     query = {field_to_match: value_to_match}  # Replace 'field_name_to_match' with your actual field name
