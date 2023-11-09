@@ -3,5 +3,8 @@
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/1800Radiator-Priority-Campaign" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/1800radiator-sales-prediction" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/spire-cube" vcs="Git" />
   </component>
 </project>
