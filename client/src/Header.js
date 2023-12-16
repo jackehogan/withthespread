@@ -3,12 +3,11 @@ import React from "react";
 const Header = () => {
   return (
     <div className="header">
-      <div className="header-logo"></div>
-      <div className="header-nav">
-        <a href="#home">Home</a>
-        <a href="#about">About</a>
-        <a href="#contact">Contact</a>
-      </div>
+      <h1 className="title">With the Spread</h1>
+      <h4 className="subtitle">Predicted outcomes Powered by data</h4>
+      <h3 className="subtitle">
+        Have a gambling problem? Call 1-800-GAMBLER for help...Pussy
+      </h3>
     </div>
   );
 };
