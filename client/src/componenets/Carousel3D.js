@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
 import "../index.css";
 import groupByWeek from "./groupByWeek";
+import Advertisement from "./advertisement";
 
 const Carousel3D = ({ schedules }) => {
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -65,6 +66,27 @@ const Carousel3D = ({ schedules }) => {
       .catch((error) => console.error("Error fetching season spreads:", error));
   }, []);
 
+  useEffect(() => {
+    // Get the current date
+    const currentDate = new Date();
+
+    // Find the closest week to the current date
+    const closestWeek = Object.keys(groupedSchedules).reduce(
+      (closest, week) => {
+        const weekDate = new Date(groupedSchedules[week][0].date);
+        const timeDiff = Math.abs(weekDate - currentDate);
+        if (timeDiff < closest.timeDiff) {
+          return { week, timeDiff };
+        }
+        return closest;
+      },
+      { week: Object.keys(groupedSchedules)[0], timeDiff: Infinity }
+    );
+
+    // Set the selectedIndex to the index of the closest week
+    setSelectedIndex(Object.keys(groupedSchedules).indexOf(closestWeek.week));
+  }, [schedules]);
+
   return (
     <div
       className="carousel-container"
@@ -80,71 +102,207 @@ const Carousel3D = ({ schedules }) => {
             className={`carousel-item ${
               index === selectedIndex ? "active" : ""
             }`}
-            style={{
-              transform: `rotateY(${
-                (index - selectedIndex) * 40
-              }deg) translateZ(300px)`,
-            }}
             onClick={() => rotateCarousel("right")}
             aria-label={`Week ${week} Carousel Item`}
           >
-            <h2 className="carousel-item-title">{`Week ${week}`}</h2>
-
-            <div className="scrollable-container">
-              <table className="carousel-item-table">
-                <thead>
-                  <tr>
-                    <th>Home</th>
-                    <th>Moneyline</th>
-                    <th>Spread</th>
-                    <th>Moneyline</th>
-                    <th>Away</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {groupedSchedules[week].map((game, i) => {
-                    const spreadData = seasonSpreads.find(
-                      (spread) => spread.opponent === game.home_team
-                    );
-                    return (
-                      <tr key={i}>
-                        <td>
+            <div className="carousel-header">
+              <h2 className="carousel-item-title">{`Week ${week}`}</h2>
+            </div>
+            <table className="carousel-item-table">
+              <thead>
+                <tr>
+                  <th>Teams</th>
+                  <th>Spread</th>
+                  <th>Score</th>
+                  <th>Pred Spread</th>
+                  <th>Spread Score</th>
+                  <th>WTS Cover</th>
+                </tr>
+              </thead>
+              <tbody>
+                {groupedSchedules[week].map((game, i) => {
+                  const spreadDataHome = seasonSpreads.find(
+                    (spread) =>
+                      spread.Week === game.week && spread.Team === game.home
+                  );
+                  const spreadDataAway = seasonSpreads.find(
+                    (spread) =>
+                      spread.Week === game.week && spread.Team === game.away
+                  );
+                  return (
+                    <tr key={i}>
+                      <td>
+                        <div className="team-container">
                           <img
                             src={game.home_logo}
                             alt={`${game.home_team} logo`}
-                          />{" "}
-                          {game.home_team}
-                        </td>
-                        <td>{game.home_moneyline}</td>
-                        <td>{spreadData ? spreadData.spread : "N/A"}</td>
-                        <td>{game.away_moneyline}</td>
-                        <td>
+                            className="team-logo"
+                          />
+                          {game.home}
+                        </div>
+                        <div></div>
+                        <div className="team-container">
                           <img
                             src={game.away_logo}
                             alt={`${game.away_team} logo`}
-                          />{" "}
-                          {game.away_team}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                            className="team-logo"
+                          />
+                          {game.away}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="stats">
+                          <div className="numbers-container">
+                            {spreadDataHome ? (
+                              spreadDataHome.spread > 0 ? (
+                                <span className="sign-positive">+</span>
+                              ) : (
+                                <span className="sign-negative">-</span>
+                              )
+                            ) : null}
+                            {spreadDataHome
+                              ? Math.abs(spreadDataHome.spread)
+                              : "Coming Soon"}
+                          </div>
+                        </div>
+                        <div className="stats">
+                          <div className="numbers-container">
+                            {spreadDataAway ? (
+                              spreadDataAway.spread > 0 ? (
+                                <span className="sign-positive">+</span>
+                              ) : (
+                                <span className="sign-negative">-</span>
+                              )
+                            ) : null}
+                            {spreadDataAway
+                              ? Math.abs(spreadDataAway.spread)
+                              : ""}
+                          </div>
+                        </div>
+                      </td>
+                      <td>
+                        <div className="stats">
+                          {spreadDataHome
+                            ? spreadDataHome.score
+                            : "Coming Soon"}
+                        </div>
+                        <div className="stats">
+                          {spreadDataAway ? spreadDataAway.score : ""}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="stats">
+                          <div className="numbers-container">
+                            {spreadDataHome ? (
+                              spreadDataHome.predspread > 0 ? (
+                                <span className="sign-positive">+</span>
+                              ) : (
+                                <span className="sign-negative">-</span>
+                              )
+                            ) : null}
+                            {spreadDataHome
+                              ? Math.abs(
+                                  Math.round(spreadDataHome.predspread * 10) /
+                                    10
+                                )
+                              : "Coming Soon"}
+                          </div>
+                        </div>
+                        <div className="stats">
+                          <div className="numbers-container">
+                            {spreadDataAway ? (
+                              spreadDataAway.predspread > 0 ? (
+                                <span className="sign-positive">+</span>
+                              ) : (
+                                <span className="sign-negative">-</span>
+                              )
+                            ) : null}
+                            {spreadDataAway
+                              ? Math.abs(
+                                  Math.round(spreadDataAway.predspread * 10) /
+                                    10
+                                )
+                              : ""}
+                          </div>
+                        </div>
+                      </td>
+                      <td>
+                        <div className="stats">
+                          <div className="numbers-container">
+                            {spreadDataHome ? (
+                              spreadDataHome.spreadscore > 0 ? (
+                                <span className="sign-positive">+</span>
+                              ) : (
+                                <span className="sign-negative">-</span>
+                              )
+                            ) : null}
+                            {spreadDataHome
+                              ? Math.abs(
+                                  Math.round(spreadDataHome.spreadscore * 10) /
+                                    10
+                                )
+                              : "Coming Soon"}
+                          </div>
+                        </div>
+                        <div className="stats">
+                          <div className="numbers-container">
+                            {spreadDataAway ? (
+                              spreadDataAway.spreadscore > 0 ? (
+                                <span className="sign-positive">+</span>
+                              ) : (
+                                <span className="sign-negative">-</span>
+                              )
+                            ) : null}
+                            {spreadDataAway
+                              ? Math.abs(
+                                  Math.round(spreadDataAway.spreadscore * 10) /
+                                    10
+                                )
+                              : ""}
+                          </div>
+                        </div>
+                      </td>
+                      <td>
+                        <div>
+                          <div className="stats">
+                            <div className="numbers-container">
+                              {spreadDataHome
+                                ? Math.abs(
+                                    Math.round(
+                                      ((spreadDataHome.predspread -
+                                        spreadDataHome.spreadscore) *
+                                        10) /
+                                        10
+                                    )
+                                  )
+                                : null}
+                            </div>
+                          </div>
+                        </div>
+                        <div>
+                          <div className="stats">
+                            <div className="numbers-container">
+                              {spreadDataAway
+                                ? Math.abs(
+                                    Math.round(
+                                      ((spreadDataAway.predspread -
+                                        spreadDataAway.spreadscore) *
+                                        10) /
+                                        10
+                                    )
+                                  )
+                                : null}
+                            </div>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+                <Advertisement />
+              </tbody>
+            </table>
           </div>
-        ))}
-      </div>
-      <div className="carousel-indicators">
-        {Object.keys(groupedSchedules).map((week, index) => (
-          <button
-            key={index}
-            className={`carousel-indicator ${
-              index === selectedIndex ? "active" : ""
-            }`}
-            onClick={() => setSelectedIndex(index)}
-          >
-            {week}
-          </button>
         ))}
       </div>
     </div>
