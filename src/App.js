@@ -4,6 +4,7 @@ import "./index.css";
 import { schedules } from "./data/schedule"; // Your data file
 import Header from "./Header";
 import Footer from "./Footer";
+import "./index.js";
 
 const App = () => {
   return (
