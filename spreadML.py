@@ -29,33 +29,30 @@ def genData(df,nextweek,nweeks):
     Xlist = [genFrames(dfmodel,startweek,nweeks)[0].reset_index() for startweek in range(1,nextweek+1-nweeks)]
     ylist = [genFrames(dfmodel,startweek,nweeks)[1] for startweek in range(1,nextweek+1-nweeks)]
     X = pd.DataFrame(np.concatenate(Xlist, axis=0))
-    X.columns = ['Team','Year','Week']+list(range(1,nweeks+1))
+    X.columns = ['Team','Year','Week']+[f'{n}_weeksago' for n in range(nweeks,0,-1)]
+    print(X.columns)
     for col in X.columns:
         if col in ['Team','Year','Week']:
             X[col] = X[col].astype('category')
         else:
             X[col] = pd.to_numeric(X[col])
     y = pd.Series(np.concatenate(ylist, axis=0))
+    y = y.astype('float')
 
     from sklearn.model_selection import train_test_split
-    import random
-    from sklearn.model_selection import cross_val_score
-    from xgboost import XGBRegressor,XGBClassifier
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33,
-                                                        random_state=random.randint(1,100)
-                                                        # random_state=42
-                                                        )
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33)
 
     Xlist = [genFrames(dfval,startweek,nweeks)[0].reset_index() for startweek in range(1,nextweek+1-nweeks)]
     ylist = [genFrames(dfval,startweek,nweeks)[1] for startweek in range(1,nextweek+1-nweeks)]
     X_val = pd.DataFrame(np.concatenate(Xlist, axis=0))
-    X_val.columns = ['Team','Year','Week']+list(range(1,nweeks+1))
+    X_val.columns = ['Team','Year','Week']+[f'{n}_weeksago' for n in range(nweeks,0,-1)]
     for col in X_val.columns:
         if col in ['Team','Year','Week']:
             X_val[col] = X_val[col].astype('category')
         else:
             X_val[col] = pd.to_numeric(X_val[col])
     y_val = pd.Series(np.concatenate(ylist, axis=0))
+    y_val = y_val.astype('float')
 
     return X_train, X_test, y_train, y_test,X_val,y_val
 
@@ -63,7 +60,7 @@ def genData(df,nextweek,nweeks):
 # nweeks = min(5,weeks_num[0])
 # X_train, X_test, y_train, y_test,X_val,y_val = genData(nextweek,nweeks)
 
-def fitxgbModel(modeltype,X_train, y_train):
+def fitxgbModel(modeltype,X_train, y_train,X_test,y_test):
     print('Model columns:', X_train.columns)
     from hyperopt import fmin, tpe, hp
     def objective(params):
@@ -74,6 +71,7 @@ def fitxgbModel(modeltype,X_train, y_train):
         #     return 1.0  # Penalize if no features are selected
 
         params = {
+            'enable_categorical':True, 'tree_method':"hist",
             'learning_rate': params['learning_rate'],
             'max_depth': int(params['max_depth']),
             'n_estimators': int(params['n_estimators']),
@@ -85,19 +83,27 @@ def fitxgbModel(modeltype,X_train, y_train):
             # Add more hyperparameters
         }
         modeldict = {'reg':XGBRegressor,'clas':XGBClassifier}
-        model = modeldict[modeltype](**params,enable_categorical=True,tree_method="hist")
+        model = modeldict[modeltype](**params)
         from sklearn.preprocessing import LabelEncoder
         y_encoded = LabelEncoder().fit_transform(np.sign(y_train))
+        y_test_encoded = LabelEncoder().fit_transform(np.sign(y_test))
         # model = XGBRegressor(**params,enable_categorical=True,tree_method="hist")
         if modeltype=='clas':
             cvscore = -cross_val_score(model, X_train, y_encoded, cv=5, scoring='accuracy')
+            model.fit(X_train,y_encoded)
+            print(f'train score = {model.score(X_train, y_encoded)}')
+            print(f'test score = {model.score(X_test,y_test_encoded)}')
         else:
             cvscore = -cross_val_score(model, X_train, y_train, cv=5, scoring='neg_mean_squared_error')
+            model.fit(X_train,y_train)
+            print(f'train score = {pd.concat([y_train,pd.Series(model.predict(X_train),index=y_train.index)],axis=1).corr()[0][1]}')
+            print(f'test score = {pd.concat([y_test,pd.Series(model.predict(X_test),index=y_test.index)],axis=1).corr()[0][1]}')
 
         return cvscore.mean()  # Hyperopt minimizes the objective, so we use negative accuracy
 
     # Define the search space for hyperparameters
     space = {
+        'enable_categorical': True, 'tree_method': "hist",
         'learning_rate': hp.uniform('learning_rate', 0.01, 0.3),
         'max_depth': hp.quniform('max_depth', 2, 5, 1),
         'n_estimators': hp.quniform('n_estimators', 50, 200, 10),
@@ -111,7 +117,7 @@ def fitxgbModel(modeltype,X_train, y_train):
     }
 
     # Run hyperparameter optimization
-    best = fmin(fn=objective, space=space, algo=tpe.suggest, max_evals=20)
+    best = fmin(fn=objective, space=space, algo=tpe.suggest, max_evals=50)
     print("Best hyperparameters:", best)
 
     def round_whole_numbers(d, decimal_places=2):
