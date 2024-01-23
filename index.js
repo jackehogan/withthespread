@@ -4,7 +4,7 @@ const { MongoClient } = require("mongodb");
 const cors = require("cors");
 
 const app = express();
-const port = 3001;
+const port = process.env.PORT || 3001;
 
 const userName = process.env.MONGO_USERNAME;
 const password = process.env.MONGO_PASSWORD;
@@ -18,7 +18,10 @@ MongoClient.connect(uri, { useUnifiedTopology: true })
     console.log("Connected to Database");
     db = client.db("withTheSpread");
   })
-  .catch((error) => console.error(error));
+  .catch((error) => {
+    console.error("Failed to connect to Database");
+    console.error(error);
+  });
 
 app.use(cors());
 
