@@ -4,7 +4,7 @@ const { MongoClient } = require("mongodb");
 const cors = require("cors");
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 3001;
 
 const userName = process.env.MONGO_USERNAME || "non-profit";
 const password = process.env.MONGO_PASSWORD || "retire";
@@ -13,10 +13,11 @@ const database = process.env.MONGO_DATABASE || "withTheSpread";
 
 uri =
   "mongodb+srv://non-profit:retire@cluster0.ml8jvfc.mongodb.net/?retryWrites=true&w=majority&appName=AtlasApp";
+
 let db;
 
 // Initialize MongoDB Connection once
-MongoClient.connect(uri)
+MongoClient.connect(uri, { useUnifiedTopology: true })
   .then((client) => {
     console.log("Connected to Database");
     db = client.db("withTheSpread");

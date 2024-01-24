@@ -4,7 +4,7 @@ const { MongoClient } = require("mongodb");
 const cors = require("cors");
 
 const app = express();
-const PORT = process.env.PORT || 3000; // Fallback to 3001 if process.env.PORT is not defined
+const PORT = 3000;
 
 const userName = process.env.MONGO_USERNAME;
 const password = process.env.MONGO_PASSWORD;
