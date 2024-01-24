@@ -1,22 +1,22 @@
 require("dotenv").config();
-const express = require('express');
+const express = require("express");
 const { MongoClient } = require("mongodb");
 const cors = require("cors");
 
 const app = express();
-const port = process.env.PORT || 3001;
+const port = process.env.PORT || 3000;
 
 const userName = process.env.MONGO_USERNAME || "non-profit";
 const password = process.env.MONGO_PASSWORD || "retire";
 const project = process.env.MONGO_PROJECT || "cluster0";
 const database = process.env.MONGO_DATABASE || "withTheSpread";
 
-const uri = `mongodb+srv://${userName}:${password}@${project}.mongodb.net/${database}?retryWrites=true&w=majority`;
-
+uri =
+  "mongodb+srv://non-profit:retire@cluster0.ml8jvfc.mongodb.net/?retryWrites=true&w=majority&appName=AtlasApp";
 let db;
 
 // Initialize MongoDB Connection once
-MongoClient.connect(uri, { useUnifiedTopology: true })
+MongoClient.connect(uri)
   .then((client) => {
     console.log("Connected to Database");
     db = client.db("withTheSpread");
@@ -39,6 +39,6 @@ app.get("/getData", async (req, res) => {
   }
 });
 
-app.listen(port, "0.0.0.0", () => {
+app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
