@@ -41,6 +41,6 @@ app.get("/getData", async (req, res) => {
   }
 });
 
-app.listen(port, host, () => {
+app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
