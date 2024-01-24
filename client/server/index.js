@@ -4,7 +4,7 @@ const { MongoClient } = require("mongodb");
 const cors = require("cors");
 
 const app = express();
-const port = process.env.PORT || 3001; // Fallback to 3001 if process.env.PORT is not defined
+const PORT = process.env.PORT || 3000; // Fallback to 3001 if process.env.PORT is not defined
 
 const userName = process.env.MONGO_USERNAME;
 const password = process.env.MONGO_PASSWORD;
@@ -33,6 +33,6 @@ app.get("/getData", async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
