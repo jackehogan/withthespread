@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const path = require("path"); // Import path module
 const { MongoClient } = require("mongodb");
 const cors = require("cors");
 
@@ -22,6 +23,7 @@ MongoClient.connect(uri, { useUnifiedTopology: true })
 
 app.use(cors());
 
+// Existing API routes
 app.get("/getData", async (req, res) => {
   try {
     const collection = db.collection("season_spreads");
@@ -33,6 +35,17 @@ app.get("/getData", async (req, res) => {
   }
 });
 
+// Serve static files from the React app in production
+if (process.env.NODE_ENV === "production") {
+  app.use(express.static(path.join(__dirname, 'build')));
+
+  app.get("*", (req, res) => {
+    res.sendFile(path.join(__dirname, 'build', 'index.html'));
+  });
+}
+
+// Start the server
 app.listen(port, () => {
-  console.log(`Server NOT running on port ${port}`);
+  console.log(`Server running on port ${port}`);
 });
+
