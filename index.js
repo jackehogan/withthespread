@@ -4,7 +4,7 @@ const { MongoClient } = require("mongodb");
 const cors = require("cors");
 
 const app = express();
-const port = 3001;
+const port = process.env.PORT || 3001;
 
 const userName = process.env.MONGO_USERNAME;
 const password = process.env.MONGO_PASSWORD;
@@ -34,5 +34,5 @@ app.get("/getData", async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`Server NOT running on port ${port}`);
 });
