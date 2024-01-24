@@ -42,5 +42,5 @@ app.get("/getData", async (req, res) => {
 });
 
 app.listen(port, host, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`Server is not running on port ${port}`);
 });
