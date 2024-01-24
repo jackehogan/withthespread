@@ -5,7 +5,7 @@ const cors = require("cors");
 
 const app = express();
 const host = process.env.HOST;
-const port = process.env.PORT;
+const port = process.env.PORT || 3001;
 
 const userName = process.env.MONGO_USERNAME || "non-profit";
 const password = process.env.MONGO_PASSWORD || "retire";
