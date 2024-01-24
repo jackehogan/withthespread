@@ -8,6 +8,7 @@ const Carousel3D = ({ schedules }) => {
   const groupedSchedules = groupByWeek(schedules);
   const carouselRef = useRef(null);
   let touchStartX = 0;
+  // eslint-disable-next-line to the line before.
   const audio = new Audio(process.env.PUBLIC_URL + "/iphone_click.mp3");
 
   useEffect(() => {
@@ -84,6 +85,7 @@ const Carousel3D = ({ schedules }) => {
     );
 
     // Set the selectedIndex to the index of the closest week
+    // eslint-disable-next-line to the line before.
     setSelectedIndex(Object.keys(groupedSchedules).indexOf(closestWeek.week));
   }, [schedules]);
 
