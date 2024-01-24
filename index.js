@@ -4,7 +4,7 @@ const { MongoClient } = require("mongodb");
 const cors = require("cors");
 
 const app = express();
-const host = "0.0.0.0";
+const host = process.env.HOST;
 const port = process.env.PORT;
 
 const userName = process.env.MONGO_USERNAME || "non-profit";
@@ -41,6 +41,6 @@ app.get("/getData", async (req, res) => {
   }
 });
 
-app.listen(port, () => {
+app.listen(port, host, () => {
   console.log(`Server running on port ${port}`);
 });
