@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from "react";
 import "../index.css";
 import groupByWeek from "./groupByWeek";
 import Advertisement from "./advertisement";
-import port from ".../index.js"
+import port from "../index.js"
 
 const Carousel3D = ({ schedules }) => {
   const [selectedIndex, setSelectedIndex] = useState(0);
