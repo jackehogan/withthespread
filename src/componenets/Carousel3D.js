@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from "react";
 import "../index.css";
 import groupByWeek from "./groupByWeek";
 import Advertisement from "./advertisement";
+import port from ".../index.js"
 
 const Carousel3D = ({ schedules }) => {
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -61,7 +62,7 @@ const Carousel3D = ({ schedules }) => {
   const [seasonSpreads, setSeasonSpreads] = useState([]);
 
   useEffect(() => {
-    fetch("https://withthespread.herokuapp.com/")
+    fetch(port)
       .then((response) => response.json())
       .then((data) => setSeasonSpreads(data))
       .catch((error) => console.error("Error fetching season spreads:", error));
