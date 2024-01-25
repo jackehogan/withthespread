@@ -61,7 +61,7 @@ const Carousel3D = ({ schedules }) => {
   const [seasonSpreads, setSeasonSpreads] = useState([]);
 
   useEffect(() => {
-    fetch("http://localhost:3001/getData")
+    fetch("https://withthespread.herokuapp.com/")
       .then((response) => response.json())
       .then((data) => setSeasonSpreads(data))
       .catch((error) => console.error("Error fetching season spreads:", error));
