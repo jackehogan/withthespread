@@ -1,0 +1,33 @@
+Team,Year,Week,coverprob,predspread,spread,order,opponent,coverprob_diff,predspread_diff
+Arizona Cardinals,2025,4,0.50836456,8.35929,1.5,0,Seattle Seahawks,0.005503416,5.9178967
+Atlanta Falcons,2025,4,0.4766956,8.593898,1.5,3,Washington Commanders,0.017061293,2.9778905
+Baltimore Ravens,2025,4,0.4854234,7.008784,-2.5,11,Kansas City Chiefs,-0.0039853454,2.643921
+Buffalo Bills,2025,4,0.54673564,8.10779,-16.5,4,New Orleans Saints,0.04053986,2.7401772
+Carolina Panthers,2025,4,0.5197407,8.380378,5.5,5,New England Patriots,0.0046025515,3.6396155
+Chicago Bears,2025,4,0.5139345,3.801635,-1.5,12,Las Vegas Raiders,-0.008219004,-5.010911
+Cincinnati Bengals,2025,4,0.4782105,8.655344,7.5,15,Denver Broncos,-0.06564444,4.3014555
+Cleveland Browns,2025,4,0.45198786,3.2832258,9.5,2,Detroit Lions,0.0,1.3999807
+Dallas Cowboys,2025,4,0.4590739,4.6808424,7.0,13,Green Bay Packers,-0.0030640364,-0.27603674
+Denver Broncos,2025,4,0.54385495,4.3538885,-7.5,15,Cincinnati Bengals,0.06564444,-4.3014555
+Detroit Lions,2025,4,0.45198786,1.8832451,-9.5,2,Cleveland Browns,0.0,-1.3999807
+Green Bay Packers,2025,4,0.46213794,4.956879,-7.0,13,Dallas Cowboys,0.0030640364,0.27603674
+Houston Texans,2025,4,0.4681573,4.975626,-7.0,6,Tennessee Titans,-0.07217723,-4.13002
+Indianapolis Colts,2025,4,0.45198786,1.8832451,3.0,9,Los Angeles Rams,-0.11858225,-6.4071145
+Jacksonville Jaguars,2025,4,0.4881733,7.279513,3.0,10,San Francisco 49ers,-0.09604496,3.3229163
+Kansas City Chiefs,2025,4,0.48940873,4.364863,2.5,11,Baltimore Ravens,0.0039853454,-2.643921
+Las Vegas Raiders,2025,4,0.5221535,8.812546,1.5,12,Chicago Bears,0.008219004,5.010911
+Los Angeles Chargers,2025,4,0.5693846,5.182165,-6.0,7,New York Giants,0.054246426,0.3785448
+Los Angeles Rams,2025,4,0.5705701,8.2903595,-3.0,9,Indianapolis Colts,0.11858225,6.4071145
+Miami Dolphins,2025,4,0.5398401,10.105927,-3.0,14,New York Jets,0.0066576004,1.3604279
+Minnesota Vikings,2025,4,0.5064589,8.367637,-2.5,1,Pittsburgh Steelers,-0.026723623,1.1309991
+New England Patriots,2025,4,0.51513815,4.740762,-5.5,5,Carolina Panthers,-0.0046025515,-3.6396155
+New Orleans Saints,2025,4,0.5061958,5.367613,16.5,4,Buffalo Bills,-0.04053986,-2.7401772
+New York Giants,2025,4,0.51513815,4.8036203,6.0,7,Los Angeles Chargers,-0.054246426,-0.3785448
+New York Jets,2025,4,0.5331825,8.7455,3.0,14,Miami Dolphins,-0.0066576004,-1.3604279
+Philadelphia Eagles,2025,4,0.5331825,7.308576,-3.5,8,Tampa Bay Buccaneers,-0.014336228,2.4539342
+Pittsburgh Steelers,2025,4,0.5331825,7.2366376,2.5,1,Minnesota Vikings,0.026723623,-1.1309991
+San Francisco 49ers,2025,4,0.58421826,3.9565966,-3.0,10,Jacksonville Jaguars,0.09604496,-3.3229163
+Seattle Seahawks,2025,4,0.50286114,2.4413934,-1.5,0,Arizona Cardinals,-0.005503416,-5.9178967
+Tampa Bay Buccaneers,2025,4,0.54751873,4.854642,3.5,8,Philadelphia Eagles,0.014336228,-2.4539342
+Tennessee Titans,2025,4,0.5403345,9.105646,7.0,6,Houston Texans,0.07217723,4.13002
+Washington Commanders,2025,4,0.4596343,5.6160073,-1.5,3,Atlanta Falcons,-0.017061293,-2.9778905

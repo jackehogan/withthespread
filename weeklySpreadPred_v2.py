@@ -4,22 +4,37 @@ import datetime
 from api_calls import mongoConn,get_db,add_to_db,getGameResults,extractLastWeeksResults,extractNextWeeksSpreads,getNextWeeksSpreads,update_document,delete_documents
 from spreadML import genData,fitxgbModel
 from xgboost import XGBRegressor,XGBClassifier
+from espn_nfl_scrape import get_nfl_scores_bs
 
 
 def loadDataset(week=None,year=None):
     dfbets = get_db(client, 'withTheSpread', 'bets')
     dfseasonspreads = get_db(client, 'withTheSpread', 'season_spreads')
     dfseasonspreads = dfseasonspreads.set_index(['Team'], drop=True).drop(['_id'], axis=1)
+    df_scrape = get_nfl_scores_bs(year,week-1)
+    df_scrape['diff'] = df_scrape['home_score'] - df_scrape['away_score']
+    df_scrape_home = df_scrape[['home_team', 'home_score','diff']].rename(columns={'home_team': 'Team', 'home_score': 'score'}).set_index('Team')
+    df_scrape_away = df_scrape[['away_team', 'away_score','diff']].rename(columns={'away_team': 'Team', 'away_score': 'score'}).set_index('Team')
+    df_scrape_away['diff'] = -df_scrape_away['diff']
+    df_scrape_all = pd.concat([df_scrape_home, df_scrape_away]).sort_index()
+    breakpoint()
+    mask = (dfseasonspreads['Week'] == week-1) & (dfseasonspreads['Year'] == year)
+    # df_scrape_all is indexed by team and has columns ['score','diff']
+    vals = df_scrape_all[['score', 'diff']].reindex(dfseasonspreads.loc[mask].index)
+
+    dfseasonspreads.loc[mask, ['score', 'diff']] = vals.values
+    breakpoint()
     # if year is None, get the current year
-    if year is None:
-        year = datetime.datetime.now().year
-    print(f'Year is {year}')
-    ### Get last week's results
-    data = getGameResults(year)
-    dfgameresults, int_weeks, nextweekstr, datesUTC = extractLastWeeksResults(data, week=week)
+    # if year is None:
+    #     year = datetime.datetime.now().year
+    # print(f'Year is {year}')
+    # ### Get last week's results
+    # data = getGameResults(year)
+    # dfgameresults, int_weeks, nextweekstr, datesUTC = extractLastWeeksResults(data, week=week)
+
 
     dfseasonspreads_lastweek = dfseasonspreads[(dfseasonspreads['Week'] == int_weeks[-1]-1) & (dfseasonspreads['Year'] == year)].drop(['diff', 'score'],
-                                                                                              axis=1).merge(dfgameresults, left_index=True, right_index=True, how='left')
+                                                                                                                                      axis=1).merge(dfgameresults, left_index=True, right_index=True, how='left')
     dfseasonspreads_lastweek['spreadscore'] = dfseasonspreads_lastweek['diff'] + dfseasonspreads_lastweek['spread']
     print(dfseasonspreads_lastweek)
     # print San Francisco 49ers result
@@ -32,7 +47,7 @@ def loadDataset(week=None,year=None):
         # dfseasonspreads.loc[dfseasonspreads['Week'] == int_weeks[-2], 'score'] = dfseasonspreads_lastweek['score']
         # dfseasonspreads.loc[dfseasonspreads['Week'] == int_weeks[-2], 'diff'] = dfseasonspreads_lastweek['diff']
         # dfseasonspreads.loc[dfseasonspreads['Week'] == int_weeks[-2], 'spreadscore'] = dfseasonspreads_lastweek['spreadscore']
-        dfseasonspreads.loc[(dfseasonspreads['Week'] == int_weeks[-2]) & (dfseasonspreads['Year'] == year), ['score', 'diff', 'spreadscore']] = dfseasonspreads_lastweek[['score', 'diff', 'spreadscore']]
+        dfseasonspreads.loc[(dfseasonspreads['Week'] == int_weeks[-1]-1) & (dfseasonspreads['Year'] == year), ['score', 'diff', 'spreadscore']] = dfseasonspreads_lastweek[['score', 'diff', 'spreadscore']]
         # alternatively could use this below
         # Check which rows will be updated
         # Define the condition for filtering `dfseasonspreads`
@@ -49,10 +64,10 @@ def loadDataset(week=None,year=None):
     print('Niners season totals:', dfseasonspreads.loc['San Francisco 49ers'])
     breakpoint()
     ### get next week's spreads
-    if int_weeks[-1] == 18:
+    if int_weeks[-1] == 19:
         dfseasonspreads_nextweek = None
     else:
-        spreaddata = getNextWeeksSpreads(datesUTC,'free')
+        spreaddata = getNextWeeksSpreads(datesUTC,api_pay_type)
         dfseasonspreads_nextweek = extractNextWeeksSpreads(spreaddata, datesUTC)
         if "San Francisco 49ers" not in dfseasonspreads_nextweek.index:
             print('No 49ers data found for next week, check to make sure they have a bye week')
@@ -61,7 +76,6 @@ def loadDataset(week=None,year=None):
         else:
             print(f'Next weeks 49ers spread is {dfseasonspreads_nextweek.loc["San Francisco 49ers"]}')
     breakpoint()
-    print('drop week 12')
     return dfbets, dfseasonspreads, dfseasonspreads_lastweek, dfseasonspreads_nextweek, int_weeks
 def predictSpreadscore(lookback_weeks):
     # import xgb models and metrics
@@ -80,20 +94,20 @@ def predictSpreadscore(lookback_weeks):
     ## train xgb models
     reg = XGBRegressor(**bestparamsreg, enable_categorical=True, tree_method="hist")
     reg.fit(X_train, y_train)
-    print(f'train score {reg.score(X_train, y_train)}')
-    print(f'test score {reg.score(X_test, y_test)}')
-    print(f'val score {reg.score(X_val, y_val)}')
+    print(f'regression train score {reg.score(X_train, y_train)}')
+    print(f'regression test score {reg.score(X_test, y_test)}')
+    print(f'regression val score {reg.score(X_val, y_val)}')
     clas = XGBClassifier(**bestparamsclas, enable_categorical=True, tree_method="hist")
     # from sklearn.preprocessing import LabelEncoder
     # label_encoder = LabelEncoder()
     # y_encoded = LabelEncoder().fit_transform(np.sign(y_train))
     y_train_enc = np.sign(y_train).replace({-1: 0, 1: 1})
     clas.fit(X_train, y_train_enc)
-    print(f'train score {clas.score(X_train, y_train_enc)}')
+    print(f'classifier train score {clas.score(X_train, y_train_enc)}')
     y_test_enc = np.sign(y_test).replace({-1: 0, 1: 1})
-    print(f'test score {clas.score(X_test, y_test_enc)}')
+    print(f'classifier test score {clas.score(X_test, y_test_enc)}')
     y_val_enc = np.sign(y_val).replace({-1: 0, 1: 1})
-    print(f'val score {clas.score(X_val, y_val_enc)}')
+    print(f'classifier val score {clas.score(X_val, y_val_enc)}')
 
 
     ## predict next week's spreads
@@ -115,7 +129,7 @@ def predictSpreadscore(lookback_weeks):
     #     print('Dropping week', int_weeks[-1])
     #     X = X.drop([int_weeks[-1]], axis=1)
     # X = X.set_index(['Team','Year'])
-    X
+
     breakpoint()
     ## for reasons not well understood by the writer this prediction is extradinarily bad, consistently predicting the wrong outcome. Knowing this the predictions will be flipped - effective in week 11 2023
     dfseasonspreads_temp = pd.concat([X.set_index('Team'),
@@ -139,42 +153,50 @@ def predictSpreadscore(lookback_weeks):
 
 def updateDatabase():
     #### happy with spread routine outcome? Next steps will save to mongoDB and csv
-    if week == 18:
+    if week == 19:
         dfseasonspreads_full = dfseasonspreads
     else:
         dfseasonspreads_full = pd.concat([dfseasonspreads, dfseasonspreads_temp])
     # print 49ers last week results
-    print('Niners last week update results totals:',  dfseasonspreads_full[(dfseasonspreads_full['Week'] == int_weeks[-2]) & (dfseasonspreads_full['Year'] == year)].loc['San Francisco 49ers'])
-    print('Niners next week predictions totals:',  dfseasonspreads_full[(dfseasonspreads_full['Week'] == int_weeks[-1]) & (dfseasonspreads_full['Year'] == year)].loc['San Francisco 49ers'])
+    if week-1 in dfseasonspreads_full['Week'].unique(): print('Niners last week update results totals:',  dfseasonspreads_full[(dfseasonspreads_full['Week'] == week-1) & (dfseasonspreads_full['Year'] == year)].loc['San Francisco 49ers'])
+    # if week != 1: print('Niners last week update results totals:',  dfseasonspreads_full[(dfseasonspreads_full['Week'] == int_weeks[-2]) & (dfseasonspreads_full['Year'] == year)].loc['San Francisco 49ers'])
+    breakpoint()
+    if week != 19: print('Niners next week predictions totals:',  dfseasonspreads_full[(dfseasonspreads_full['Week'] == int_weeks[-1]) & (dfseasonspreads_full['Year'] == year)].loc['San Francisco 49ers'])
 
     breakpoint()
 
 
     dfseasonspreads_full.to_csv('data/Season_spreads.csv')
-    if week != 18:
+    if week != 19:
         dfseasonspreads_temp.to_csv(f'data/Season_spreads week{int_weeks[-1]}-{year}.csv')
 
     breakpoint()
+    print('update database is next. Check dfupdate')
     if int_weeks[-1] != 1:
         ## check to make sure following steps update last weeks data correctly
         dfupdate = dfseasonspreads_full[(dfseasonspreads_full['Week'] == int_weeks[-2]) & (dfseasonspreads_full['Year'] == year)]
         ##update last week's data in mongoDB (score,diff,spreadscore)
         update_document(client,'withTheSpread','season_spreads',int_weeks[-2], year, ['score','diff','spreadscore'],dfupdate.reset_index())
     ## update next weeks data, all columns, score,diff,spreadscore are null
-    if week != 18:
+    if week != 19:
         add_to_db(client,'withTheSpread','season_spreads',dfseasonspreads_full[(dfseasonspreads_full['Week']==int_weeks[-1])
                                                                                           & (dfseasonspreads_full['Year']==year)])
     ##replace backup db with full season df
-    delete_documents(client, 'withTheSpread', 'season_spreads_backup', 'All', 'All')
+    delete_documents(client, 'withTheSpread', 'season_spreads_backup', {"All": "All"})
     add_to_db(client,'withTheSpread','season_spreads_backup',dfseasonspreads_full)
 
 if __name__ == '__main__':
     ### Get data from mongoDB
     client = mongoConn()
     year = 2024
-    week = 15
-    dfbets, dfseasonspreads, dfseasonspreads_lastweek, dfseasonspreads_nextweek, int_weeks = loadDataset(week=week,year=year)
+    week = 19
+    api_pay_type = 'paid'
+    dfbets, dfseasonspreads, dfseasonspreads_lastweek, dfseasonspreads_nextweek, int_weeks = loadDataset(
+        week=week
+        ,year=year
+    )
+    if not week: week = int_weeks[-1]
     ### train model
-    if week != 18: dfseasonspreads, dfseasonspreads_temp = predictSpreadscore(lookback_weeks=5)
+    if week != 19: dfseasonspreads, dfseasonspreads_temp = predictSpreadscore(lookback_weeks=5)
     updateDatabase()
     client.close()

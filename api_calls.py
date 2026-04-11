@@ -41,7 +41,9 @@ def add_to_db(client,mongo_db,mongo_collection,df):
     db = client[mongo_db]
     # Create the collection
     collection = db[mongo_collection]
-    data = df.reset_index().rename(columns={'index': 'Team'}).to_dict(orient='records')
+    if 'Team' not in df.columns:
+        df = df.reset_index().rename(columns={'index': 'Team'})
+    data = df.to_dict(orient='records')
     collection.insert_many(data)
 
 def getGameResults(year):
@@ -66,6 +68,7 @@ def extractLastWeeksResults(data,week=None):
              game['game']['stage'] == 'Regular Season' and game['game']['status']['short'] != 'NS']
     weeks = sorted(list(set([game['game']['week'] for game in games])))
     int_weeks = sorted([int(week.split(' ')[1]) for week in weeks])
+    # int_weeks = [0] + int_weeks
     if not week: week = int_weeks[-1]+1
     int_weeks = list(set(int_weeks+[week]))
         # if late in running routine
@@ -124,25 +127,27 @@ def getNextWeeksSpreads(dates=None, key_type='free'):
     MARKETS = 'h2h,spreads,totals'
     ODDS_FORMAT = 'american'
     # get max date in dates and convert to this format ''2023-10-10T12:15:00Z'
-
+    if dates is None: dates = [datetime.datetime.today()]
     if key_type=='free':
-        DATE = datetime.datetime.today().strftime('%Y-%m-%d')
+        # DATE = datetime.datetime.today().strftime('%Y-%m-%d')
+        pass
     else:
         DATE = min(dates)
         datetime_format = '%Y-%m-%dT%H:%M:%SZ'
-        minDate = datetime.datetime.strptime(min(dates), datetime_format).date()
-        maxDate = datetime.datetime.strptime(max(dates), datetime_format).date()
+        minDate = min(dates).strftime(datetime_format)
+        maxDate = max(dates).strftime(datetime_format)
+        # minDate = DATE.strptime(min(dates), datetime_format).date()
+        # maxDate = datetime.datetime.strptime(max(dates), datetime_format).date()
 
     if key_type == 'free': url = f'https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?regions=us&markets=h2h,spreads,totals&oddsFormat=american&apiKey={API_KEY}'
     else: url = f'https://api.the-odds-api.com/v4/historical/sports/{SPORT}/odds?apiKey={API_KEY}&regions={REGIONS}&markets={MARKETS}&oddsFormat={ODDS_FORMAT}'
-    if key_type == 'paid': url = url + f'&date={DATE}'
+    if key_type == 'paid': url = url + f'&date={minDate}'
 
     r = requests.get(url)
     if r.status_code == 200:
         # for p in r.content:
         #     print(p)
         spreaddata = json.loads(r.content)
-    breakpoint()
     print('check spreaddata')
     if key_type == 'paid': spreaddata = spreaddata['data']
     #     hist_spreaddata = json.loads(r.content)
@@ -152,7 +157,9 @@ def getNextWeeksSpreads(dates=None, key_type='free'):
     # filter out games that are not in the date range
     # spreaddata = [game for game in spreaddata if game['commence_time'] >= minDate and game['commence_time'] <= maxDate]
     if key_type == 'paid':
-        spreaddata = [game for game in spreaddata if datetime.datetime.strptime(game['commence_time'],datetime_format).date() >= minDate and datetime.datetime.strptime(game['commence_time'],datetime_format).date() <= maxDate]
+        spreaddata = [game for game in spreaddata if
+                      game['commence_time'] >= minDate and
+                      game['commence_time'] <= maxDate]
         print(f'number of games in spreaddata after date filter = {len(spreaddata)}')
     print('Remaining requests', r.headers['x-requests-remaining'])
     print('Used requests', r.headers['x-requests-used'])
@@ -163,7 +170,12 @@ def extractNextWeeksSpreads(spreaddata,datesUTC):
     datetime_format = '%Y-%m-%dT%H:%M:%SZ'
     date_format = '%Y-%m-%d'
     nextweek = spreaddata
-    nextweek = [game for game in spreaddata if datetime.datetime.strptime(game['commence_time'],datetime_format)
+    if datesUTC:
+        nextweek = [game for game in spreaddata if
+                    datetime.datetime.strptime(game['commence_time'],datetime_format).date() >= datesUTC[0]
+                    and datetime.datetime.strptime(game['commence_time'],datetime_format).date() <= datesUTC[-1]]
+    else:
+        nextweek = [game for game in spreaddata if datetime.datetime.strptime(game['commence_time'],datetime_format)
                 < datetime.datetime.today() + datetime.timedelta(days=7)]
     games = [game['bookmakers'][0]['markets'] for game in
              nextweek]  # + [game['bookmakers'][1]['markets'] for game in thisweek]
@@ -189,42 +201,78 @@ def extractNextWeeksSpreads(spreaddata,datesUTC):
     # check next week spreads
     return dfseasonspreads_nextweek
 
-def delete_documents(client, mongo_db, mongo_collection, field_to_match, value_to_match):
+# def delete_documents(client, mongo_db, mongo_collection, field_to_match, value_to_match):
+#     """
+#     Delete documents from a MongoDB collection that match a certain value.
+#
+#     Parameters
+#     ----------
+#     mongo_db : str
+#         Name of the MongoDB database.
+#     mongo_collection : str
+#         Name of the MongoDB collection.
+#     value_to_match : int or str
+#         Value to match for deletion.
+#
+#     Returns
+#     -------
+#     None.
+#     """
+#
+#     # Connect to the database and collection
+#     database = client[mongo_db]
+#     collection = database[mongo_collection]
+#
+#     if field_to_match=='All' and value_to_match=='All':
+#         collection.delete_many({})
+#         print(f"Deleted all documents {mongo_collection} in the collection.")
+#         return
+#
+#
+#     # Create a query to find documents matching the value
+#     query = {field_to_match: value_to_match}  # Replace 'field_name_to_match' with your actual field name
+#
+#     # Delete documents that match the query
+#     result = collection.delete_many(query)
+#
+#     # Print the number of deleted documents
+#     print(f"Deleted {result.deleted_count} documents that matched the value.")
+def delete_documents(client, mongo_db, mongo_collection, match_criteria):
     """
-    Delete documents from a MongoDB collection that match a certain value.
+    Delete documents from a MongoDB collection that match certain criteria.
 
     Parameters
     ----------
+    client : MongoClient
+        MongoDB client instance.
     mongo_db : str
         Name of the MongoDB database.
     mongo_collection : str
         Name of the MongoDB collection.
-    value_to_match : int or str
-        Value to match for deletion.
+    match_criteria : dict
+        Dictionary of fields and their values to match for deletion.
+        Example: {"Week": 12, "Year": 2024}
 
     Returns
     -------
-    None.
+    None
     """
 
     # Connect to the database and collection
     database = client[mongo_db]
     collection = database[mongo_collection]
 
-    if field_to_match=='All' and value_to_match=='All':
+    # Handle special case to delete all documents
+    if match_criteria == {"All": "All"}:
         collection.delete_many({})
-        print(f"Deleted all documents {mongo_collection} in the collection.")
+        print(f"Deleted all documents in the '{mongo_collection}' collection.")
         return
 
-
-    # Create a query to find documents matching the value
-    query = {field_to_match: value_to_match}  # Replace 'field_name_to_match' with your actual field name
-
-    # Delete documents that match the query
-    result = collection.delete_many(query)
+    # Delete documents matching the criteria
+    result = collection.delete_many(match_criteria)
 
     # Print the number of deleted documents
-    print(f"Deleted {result.deleted_count} documents that matched the value.")
+    print(f"Deleted {result.deleted_count} documents matching criteria: {match_criteria}.")
 
 def update_document(client, mongo_db, mongo_collection, week, year, fields_to_update,df):
     """

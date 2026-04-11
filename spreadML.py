@@ -8,7 +8,7 @@ from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import LabelEncoder
 
 def genData(df,nextweek,nweeks):
-
+    print(df.reset_index()['Year'].unique())
     def genFrames(df,startweek,nweeks):
         ytemp = df[startweek+nweeks]
         ytemp = ytemp[ytemp!=0].dropna()
@@ -19,10 +19,13 @@ def genData(df,nextweek,nweeks):
         # Xtemp['Year'] = Xtemp['Year'].astype('category')
         return Xtemp,ytemp#,year,week
     # dfspread = pd.read_csv('data/dfspread.csv',index_col=[0,1,2])
-    dfspread = df[df['Bet']=='SpreadScore'].drop(['_id','Bet'],axis=1).set_index(['Team','Year','teamyearid'])
+    dfspread = df[df['Bet'].str.lower()=='spreadscore'].drop(['_id','Bet'],axis=1).set_index(['Team','Year','teamyearid'])
     dfspread.columns = [int(col) if col not in ['Team','Year','teamyearid'] else col for col in dfspread.columns]
-    dfmodel = dfspread.loc[pd.IndexSlice[2022] != dfspread.index.get_level_values('Year')]
-    dfval = dfspread.loc[pd.IndexSlice[2022] == dfspread.index.get_level_values('Year')]
+    breakpoint()
+    max_year = dfspread.index.get_level_values('Year').max()
+    print(f'Max year: {max_year}')
+    dfmodel = dfspread.loc[pd.IndexSlice[max_year] != dfspread.index.get_level_values('Year')]
+    dfval = dfspread.loc[pd.IndexSlice[max_year] == dfspread.index.get_level_values('Year')]
 
     # thisweek = weeks_num[0]+1
     # nweeks = min(5,weeks_num[0])
