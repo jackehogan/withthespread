@@ -31,6 +31,13 @@ class SportConfig:
     # Season held out as validation set during model training.
     validation_season: int
 
+    # Regular season date bounds as (month, day), used to exclude preseason
+    # and playoff games when the API provides no stage field to filter on.
+    # For cross-year seasons (NBA), end is relative to season_year + 1.
+    # Set to None for sports where stage-based filtering is sufficient (NFL).
+    regular_season_start: tuple[int, int] | None = None
+    regular_season_end: tuple[int, int] | None = None
+
     def format_season(self, year: int) -> str:
         """Return the season string expected by api-sports.io."""
         if "{year+1}" in self.api_sports_season_fmt:
@@ -56,6 +63,10 @@ NBA = SportConfig(
     odds_api_sport="basketball_nba",
     season_periods=82,
     validation_season=2023,
+    # Regular season historically runs mid-Oct through mid-Apr.
+    # Oct 16 safely excludes preseason; Apr 15 safely excludes playoffs.
+    regular_season_start=(10, 16),
+    regular_season_end=(4, 15),
 )
 
 SPORTS: dict[str, SportConfig] = {

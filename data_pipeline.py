@@ -181,11 +181,40 @@ def parse_game_results(
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
+    df = filter_regular_season(df, sport, season)
+
     if sport.name == "nba":
         # Assign sequential game numbers per team, ordered by date
         df = df.sort_values("date")
         df["period"] = df.groupby("team").cumcount() + 1
     return df.reset_index(drop=True)
+
+
+def filter_regular_season(
+    df: pd.DataFrame,
+    sport: SportConfig,
+    season: int,
+) -> pd.DataFrame:
+    """
+    Remove preseason and playoff rows using the date bounds in SportConfig.
+
+    For cross-year seasons (NBA), start is in `season` and end is in
+    `season + 1`. For same-year seasons (NFL) this is a no-op since NFL
+    already filters by stage string. Returns df unchanged if no bounds set.
+    """
+    if sport.regular_season_start is None or sport.regular_season_end is None:
+        return df
+    if df.empty:
+        return df
+
+    sm, sd = sport.regular_season_start
+    em, ed = sport.regular_season_end
+    end_year = season + 1 if sm > em else season  # cross-year if start month > end month
+
+    start_date = f"{season}-{sm:02d}-{sd:02d}"
+    end_date = f"{end_year}-{em:02d}-{ed:02d}"
+
+    return df[(df["date"] >= start_date) & (df["date"] <= end_date)].copy()
 
 
 def _extract_period(fields: dict, sport: SportConfig) -> int | None:

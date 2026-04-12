@@ -24,6 +24,22 @@ import model as ml
 from config import SportConfig
 
 
+def _fetch_games_filtered(client, sport: SportConfig, season: int | None = None) -> "pd.DataFrame":
+    """Fetch games from DB and apply regular season date filter if configured."""
+    df = db.fetch_games(client, sport.name, season)
+    if season is not None:
+        return dp.filter_regular_season(df, sport, season)
+    # No single season — filter each season individually then recombine
+    if df.empty or "season" not in df.columns:
+        return df
+    import pandas as pd
+    seasons = df["season"].unique()
+    return pd.concat(
+        [dp.filter_regular_season(df[df["season"] == s], sport, s) for s in seasons],
+        ignore_index=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Weekly pipeline
 # ---------------------------------------------------------------------------
@@ -71,7 +87,7 @@ def run(
         return pd.DataFrame()
 
     # Merge in spread values already stored in the DB so we can compute SpreadScore
-    stored = db.fetch_games(client, sport.name, season)
+    stored = _fetch_games_filtered(client, sport, season)
     if not stored.empty:
         spread_lookup = (
             stored[["team", "period", "spread"]].dropna(subset=["spread"])
@@ -106,7 +122,7 @@ def run(
 
     # Step 3: build features and train
     print("[3/4] Building features and training models...")
-    all_games = db.fetch_games(client, sport.name)
+    all_games = _fetch_games_filtered(client, sport)
     X_train, X_test, y_train, y_test, X_val, y_val = ml.build_features(
         all_games, next_period, lookback, sport.validation_season
     )
@@ -116,7 +132,7 @@ def run(
 
     # Step 4: generate and store predictions
     print("[4/4] Generating predictions...")
-    season_games = db.fetch_games(client, sport.name, season)
+    season_games = _fetch_games_filtered(client, sport, season)
     X_pred = ml.build_prediction_features(season_games, next_period, lookback, season)
     if X_pred.empty:
         print("  Not enough season data to predict.")
