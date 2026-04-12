@@ -90,11 +90,18 @@ def build_features(
         )
 
     X = pd.concat(X_parts, ignore_index=True)
+    # Re-cast after concat: mismatched category sets collapse to object
+    for col in _CAT_COLS:
+        if col in X.columns:
+            X[col] = X[col].astype("category")
     y = pd.concat(y_parts, ignore_index=True).astype(float)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, random_state=42)
 
     if Xv_parts:
         X_val = pd.concat(Xv_parts, ignore_index=True)
+        for col in _CAT_COLS:
+            if col in X_val.columns:
+                X_val[col] = X_val[col].astype("category")
         y_val = pd.concat(yv_parts, ignore_index=True).astype(float)
     else:
         X_val = pd.DataFrame(columns=X.columns)
