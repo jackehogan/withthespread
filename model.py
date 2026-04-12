@@ -20,12 +20,6 @@ Targets
   Regression    : predict SpreadScore for the upcoming period
   Classification: predict whether SpreadScore > 0 (team covers the spread)
 
-Note on sign inversion
-----------------------
-Empirically the raw predictions are systematically in the wrong direction.
-Both outputs are negated before being returned by predict().  Re-evaluate
-after accumulating more labelled data.
-
 Public interface
 ----------------
 build_features(games_df, next_period, lookback, validation_season)
@@ -302,10 +296,11 @@ def predict(
     Generate predictions indexed by team.
 
     Returns DataFrame with columns: predspread, coverprob.
-    Both values are negated — see module docstring for explanation.
+    predspread : expected SpreadScore (positive = team expected to cover)
+    coverprob  : probability of covering the spread (higher = more likely to cover)
     """
-    predspread = -reg.predict(X_pred[reg.get_booster().feature_names])
-    coverprob = 1.0 - clas.predict_proba(X_pred[clas.get_booster().feature_names])[:, 1]
+    predspread = reg.predict(X_pred[reg.get_booster().feature_names])
+    coverprob = clas.predict_proba(X_pred[clas.get_booster().feature_names])[:, 1]
     return pd.DataFrame(
         {"predspread": predspread, "coverprob": coverprob},
         index=X_pred["team"].values,
