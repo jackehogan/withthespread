@@ -24,7 +24,6 @@ from pipeline import _fetch_games_filtered
 def run_backtest(
     sport_name: str,
     eval_season: int,
-    lookback: int,
     start_period: int,
     max_evals: int,
 ) -> pd.DataFrame:
@@ -53,16 +52,13 @@ def run_backtest(
             continue
         truth["covered"] = (truth["spreadscore"] > 0).astype(int)
 
-        # Build features using all data available before this period
+        # Select lookback, build features, train
         try:
-            X_train, X_test, y_train, y_test, X_val, y_val = ml.build_features(
-                all_games, period, lookback, sport.eval_season, sport.eval_split_period
-            )
-            reg, clas, _ = ml.train_models(
-                X_train, X_test, y_train, y_test, X_val, y_val, max_evals
+            reg, clas, _, best_lookback = ml.train_models(
+                all_games, period, sport.eval_season, sport.eval_split_period, max_evals
             )
             X_pred = ml.build_prediction_features(
-                season_games, period, lookback, eval_season
+                season_games, period, best_lookback, eval_season
             )
         except Exception as exc:
             print(f"  Period {period}: skipped ({exc})")
@@ -79,8 +75,8 @@ def run_backtest(
 
         n = len(merged)
         acc = (merged["coverprob"].round() == merged["covered"]).mean()
-        print(f"  Period {period:3d}: {n:2d} teams, acc={acc:.3f}, "
-              f"coverprob range [{merged['coverprob'].min():.3f}, {merged['coverprob'].max():.3f}]")
+        print(f"  Period {period:3d}: {n:2d} teams, lb={best_lookback}, acc={acc:.3f}, "
+              f"coverprob [{merged['coverprob'].min():.3f}, {merged['coverprob'].max():.3f}]")
 
     if not records:
         print("No predictions generated.")
@@ -127,11 +123,10 @@ if __name__ == "__main__":
     parser.add_argument("--sport", choices=list(SPORTS), default="nba")
     parser.add_argument("--season", type=int, required=True,
                         help="Season to evaluate (e.g. 2024)")
-    parser.add_argument("--lookback", type=int, default=10)
     parser.add_argument("--start-period", type=int, default=20, dest="start_period",
                         help="First period to predict (need lookback prior periods)")
     parser.add_argument("--max-evals", type=int, default=10, dest="max_evals",
                         help="Hyperopt budget per model per period (keep low for speed)")
     args = parser.parse_args()
 
-    run_backtest(args.sport, args.season, args.lookback, args.start_period, args.max_evals)
+    run_backtest(args.sport, args.season, args.start_period, args.max_evals)

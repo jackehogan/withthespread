@@ -64,7 +64,6 @@ def _cmd_run(args: argparse.Namespace) -> None:
             sport=sport,
             season=args.season,
             next_period=args.period,
-            lookback=args.lookback,
             client=client,
             key_type=args.key_type,
             max_evals=args.max_evals,
@@ -107,8 +106,6 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Season start year (default: current year).")
     p_run.add_argument("--period", type=int, required=True,
                        help="Next period to predict (NFL week or NBA game number).")
-    p_run.add_argument("--lookback", type=int, default=5,
-                       help="Prior periods used as features (default: 5).")
     p_run.add_argument("--key-type", choices=["free", "paid"], default="free",
                        dest="key_type", help="Odds API key type (default: free).")
     p_run.add_argument("--max-evals", type=int, default=10, dest="max_evals",

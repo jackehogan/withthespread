@@ -48,7 +48,6 @@ def run(
     sport: SportConfig,
     season: int,
     next_period: int,
-    lookback: int,
     client: MongoClient,
     key_type: str = "free",
     max_evals: int = 10,
@@ -68,10 +67,9 @@ def run(
     sport       : SportConfig instance (e.g. NFL or NBA)
     season      : Season start year (e.g. 2024)
     next_period : Period number to predict (NFL week or NBA game number)
-    lookback    : Number of prior periods used as model features
     client      : Open MongoClient
     key_type    : 'free' or 'paid' for the-odds-api.com
-    max_evals   : Hyperopt evaluation budget per model
+    max_evals   : Hyperopt evaluation budget per model (lookback also tuned)
 
     Returns
     -------
@@ -123,17 +121,15 @@ def run(
     # Step 3: build features and train
     print("[3/4] Building features and training models...")
     all_games = _fetch_games_filtered(client, sport)
-    X_train, X_test, y_train, y_test, X_val, y_val = ml.build_features(
-        all_games, next_period, lookback, sport.eval_season, sport.eval_split_period
+    reg, clas, scores, best_lookback = ml.train_models(
+        all_games, next_period, sport.eval_season, sport.eval_split_period, max_evals
     )
-    print(f"  Rows — train: {len(X_train)}, test: {len(X_test)}, val: {len(X_val)}")
-    reg, clas, scores = ml.train_models(X_train, X_test, y_train, y_test, X_val, y_val, max_evals)
     print(f"  Scores: {scores}")
 
     # Step 4: generate and store predictions
     print("[4/4] Generating predictions...")
     season_games = _fetch_games_filtered(client, sport, season)
-    X_pred = ml.build_prediction_features(season_games, next_period, lookback, season)
+    X_pred = ml.build_prediction_features(season_games, next_period, best_lookback, season)
     if X_pred.empty:
         print("  Not enough season data to predict.")
         return pd.DataFrame()
