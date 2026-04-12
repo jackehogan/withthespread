@@ -56,7 +56,7 @@ def run_backtest(
         # Build features using all data available before this period
         try:
             X_train, X_test, y_train, y_test, X_val, y_val = ml.build_features(
-                all_games, period, lookback, sport.validation_season
+                all_games, period, lookback, sport.eval_season, sport.eval_split_period
             )
             reg, clas, _ = ml.train_models(
                 X_train, X_test, y_train, y_test, X_val, y_val, max_evals

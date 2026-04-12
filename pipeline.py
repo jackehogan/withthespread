@@ -124,7 +124,7 @@ def run(
     print("[3/4] Building features and training models...")
     all_games = _fetch_games_filtered(client, sport)
     X_train, X_test, y_train, y_test, X_val, y_val = ml.build_features(
-        all_games, next_period, lookback, sport.validation_season
+        all_games, next_period, lookback, sport.eval_season, sport.eval_split_period
     )
     print(f"  Rows — train: {len(X_train)}, test: {len(X_test)}, val: {len(X_val)}")
     reg, clas, scores = ml.train_models(X_train, X_test, y_train, y_test, X_val, y_val, max_evals)

@@ -5,7 +5,8 @@ To add a new sport:
   1. Add a SportConfig instance below.
   2. Verify api_sports_host and api_sports_league against api-sports.io docs.
   3. Verify odds_api_sport against the-odds-api.com /v4/sports endpoint.
-  4. Choose a validation_season (held-out year for model evaluation).
+  4. Choose an eval_season (held-out year) and eval_split_period (period that
+     divides the eval season into test [before] and val [from]).
   5. Register it in the SPORTS dict.
 """
 
@@ -28,8 +29,11 @@ class SportConfig:
     odds_api_sport: str
     # Periods in a full regular season (weeks for NFL, games for NBA).
     season_periods: int
-    # Season held out as validation set during model training.
-    validation_season: int
+    # Season held out entirely from training (split into test + val).
+    eval_season: int
+    # Period boundary within eval_season: target periods < this → test set,
+    # target periods >= this → val set. Roughly the season midpoint.
+    eval_split_period: int
 
     # Regular season date bounds as (month, day), used to exclude preseason
     # and playoff games when the API provides no stage field to filter on.
@@ -57,7 +61,8 @@ NFL = SportConfig(
     api_sports_season_fmt="{year}",
     odds_api_sport="americanfootball_nfl",
     season_periods=18,
-    validation_season=2022,
+    eval_season=2022,
+    eval_split_period=10,  # weeks 1-9 → test, weeks 10-18 → val
 )
 
 NBA = SportConfig(
@@ -67,7 +72,8 @@ NBA = SportConfig(
     api_sports_season_fmt="{year}-{year+1}",
     odds_api_sport="basketball_nba",
     season_periods=82,
-    validation_season=2023,
+    eval_season=2023,
+    eval_split_period=42,  # games 1-41 → test, games 42-82 → val
     # Regular season historically runs mid-Oct through mid-Apr.
     # Oct 16 safely excludes preseason; Apr 15 safely excludes playoffs.
     regular_season_start=(10, 16),

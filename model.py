@@ -33,7 +33,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from hyperopt import fmin, hp, tpe
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.model_selection import cross_val_score
 from xgboost import XGBClassifier, XGBRegressor
 
 _XGB_FIXED = {"enable_categorical": True, "tree_method": "hist"}
@@ -57,68 +57,84 @@ def build_features(
     games_df: pd.DataFrame,
     next_period: int,
     lookback: int,
-    validation_season: int,
+    eval_season: int,
+    eval_split_period: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.DataFrame, pd.Series]:
     """
-    Build train/test/validation splits from long-format historical game data.
+    Build train/test/val splits with strict temporal separation.
 
     Feature matrix  : rolling `spreadscore` — NaN allowed in feature periods,
                       XGBoost handles missing values natively.
     Target          : `spreadscore` at the target period — must be non-NaN.
 
-    Only the target period requires a spread line; feature periods with
-    missing SpreadScore contribute NaN cells rather than being discarded,
-    giving ~33x more training rows than requiring all periods to have spreads.
+    Split strategy
+    --------------
+    - Train : all seasons except eval_season
+    - Test  : eval_season, windows whose target period <  eval_split_period
+    - Val   : eval_season, windows whose target period >= eval_split_period
+
+    No random shuffling — strictly time-ordered to prevent leakage.
 
     Parameters
     ----------
-    games_df         : columns team, season, period, spreadscore
-    next_period      : the period to predict; windows end before it
-    lookback         : number of prior spreadscore values used as features
-    validation_season: season held out entirely from train/test split
+    games_df          : columns team, season, period, spreadscore
+    next_period       : the period to predict; windows end before it
+    lookback          : number of prior spreadscore values used as features
+    eval_season       : season held out entirely from training
+    eval_split_period : period boundary dividing test (before) and val (from)
 
     Returns
     -------
     X_train, X_test, y_train, y_test, X_val, y_val
     """
-    # Single spreadscore pivot — NaN allowed in feature cells, required at target.
     df_ss = games_df[["team", "season", "period", "spreadscore"]]
-    # Keep all rows so NaN features are preserved; pivot fills missing with NaN.
     ss_pivot = df_ss.pivot_table(
         index=["team", "season"], columns="period", values="spreadscore"
     )
 
-    is_val = ss_pivot.index.get_level_values("season") == validation_season
-    feat_train = ss_pivot[~is_val]
-    feat_val = ss_pivot[is_val]
-    # Target pivot is the same table — _collect_window will dropna on the
-    # target column only.
-    tgt_train = feat_train
-    tgt_val = feat_val
+    is_eval = ss_pivot.index.get_level_values("season") == eval_season
+    train_pivot = ss_pivot[~is_eval]
+    eval_pivot  = ss_pivot[is_eval]
 
-    X_parts, y_parts, Xv_parts, yv_parts = [], [], [], []
+    X_train_parts, y_train_parts = [], []
+    X_test_parts,  y_test_parts  = [], []
+    X_val_parts,   y_val_parts   = [], []
+
     for start in range(1, next_period - lookback + 1):
         target = start + lookback
-        _collect_window(feat_train, tgt_train, start, lookback, target, X_parts, y_parts)
-        _collect_window(feat_val, tgt_val, start, lookback, target, Xv_parts, yv_parts)
+        _collect_window(train_pivot, train_pivot, start, lookback, target,
+                        X_train_parts, y_train_parts)
+        if target < eval_split_period:
+            _collect_window(eval_pivot, eval_pivot, start, lookback, target,
+                            X_test_parts, y_test_parts)
+        else:
+            _collect_window(eval_pivot, eval_pivot, start, lookback, target,
+                            X_val_parts, y_val_parts)
 
-    if not X_parts:
+    if not X_train_parts:
         raise ValueError(
             f"No training windows found (next_period={next_period}, lookback={lookback}). "
             f"Need at least {lookback + 1} periods of data."
         )
 
-    X = pd.concat(X_parts, ignore_index=True)
-    _recast_categoricals(X)
-    y = pd.concat(y_parts, ignore_index=True).astype(float)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, random_state=42)
+    def _concat(parts, y_parts):
+        X = pd.concat(parts, ignore_index=True)
+        _recast_categoricals(X)
+        y = pd.concat(y_parts, ignore_index=True).astype(float)
+        return X, y
 
-    if Xv_parts:
-        X_val = pd.concat(Xv_parts, ignore_index=True)
-        _recast_categoricals(X_val)
-        y_val = pd.concat(yv_parts, ignore_index=True).astype(float)
+    X_train, y_train = _concat(X_train_parts, y_train_parts)
+
+    if X_test_parts:
+        X_test, y_test = _concat(X_test_parts, y_test_parts)
     else:
-        X_val = pd.DataFrame(columns=X.columns)
+        X_test  = pd.DataFrame(columns=X_train.columns)
+        y_test  = pd.Series(dtype=float)
+
+    if X_val_parts:
+        X_val, y_val = _concat(X_val_parts, y_val_parts)
+    else:
+        X_val = pd.DataFrame(columns=X_train.columns)
         y_val = pd.Series(dtype=float)
 
     return X_train, X_test, y_train, y_test, X_val, y_val
