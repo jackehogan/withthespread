@@ -5,6 +5,19 @@ Two external APIs:
   - api-sports.io     : historical game results (scores, dates)
   - the-odds-api.com  : betting spreads (live and historical)
 
+API structure differences (handled internally by _normalize_game)
+-----------------------------------------------------------------
+Football                          Basketball
+--------------------------------  --------------------------------
+game["game"]["stage"]             game["stage"]  (null = regular season)
+game["game"]["status"]["short"]   game["status"]["short"]
+game["game"]["date"]["date"]      game["date"]   (ISO string)
+game["game"]["date"]["time"]      game["time"]
+game["game"]["week"]              game["week"]   (always null for NBA)
+game["teams"]["away"]["name"]     game["teams"]["visitors"]["name"]
+game["scores"]["away"]["total"]   game["scores"]["visitors"]["livePoints"]
+game["scores"]["home"]["total"]   game["scores"]["home"]["livePoints"]
+
 Public interface
 ----------------
 fetch_season_games(sport, season)              -> list[dict]
@@ -25,6 +38,13 @@ from config import SportConfig
 
 _ODDS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
+# Stage strings that mean a game is NOT regular season for each sport.
+# Anything not in this set (including null/empty) is treated as regular season.
+_NON_REGULAR_STAGES = {
+    "nfl": {"Pre Season", "Post Season", "Pro Bowl"},
+    "nba": {"NBA Playoffs", "Play-In Tournament", "All-Star"},
+}
+
 
 def _read_config(path: str = "data/config.txt") -> dict:
     with open(path) as f:
@@ -38,6 +58,65 @@ def _api_sports_get(host: str, path: str, api_key: str) -> dict:
         "x-rapidapi-key": api_key,
     })
     return json.loads(conn.getresponse().read().decode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Game normalisation — handles structural differences between sport APIs
+# ---------------------------------------------------------------------------
+
+def _normalize_game(game: dict, sport: SportConfig) -> dict | None:
+    """
+    Extract a consistent set of fields from a raw api-sports.io game object.
+
+    Returns None if the game should be skipped (non-regular-season or
+    scores not yet available). Otherwise returns:
+        status    str   "NS" = not started, "FT" = finished, etc.
+        home_team str
+        away_team str
+        home_score int | None
+        away_score int | None
+        game_date  str  "YYYY-MM-DD"
+        game_time  str  "HH:MM"
+        week       str  "Week N" for NFL, empty for NBA
+    """
+    if sport.name == "nfl":
+        g = game["game"]
+        stage = g.get("stage") or ""
+        if stage in _NON_REGULAR_STAGES["nfl"] or stage == "":
+            # NFL: must explicitly be "Regular Season"
+            if stage != "Regular Season":
+                return None
+        return {
+            "status":     g["status"]["short"],
+            "home_team":  game["teams"]["home"]["name"],
+            "away_team":  game["teams"]["away"]["name"],
+            "home_score": game["scores"]["home"]["total"],
+            "away_score": game["scores"]["away"]["total"],
+            "game_date":  g["date"]["date"],
+            "game_time":  g["date"].get("time", "00:00") or "00:00",
+            "week":       g.get("week") or "",
+        }
+
+    # Basketball ---------------------------------------------------------------
+    stage = game.get("stage") or ""
+    if stage and stage in _NON_REGULAR_STAGES["nba"]:
+        return None
+
+    # game["date"] is an ISO string e.g. "2024-10-22T00:00:00.000Z"
+    date_raw = game.get("date") or ""
+    game_date = date_raw[:10] if date_raw else ""
+    game_time = game.get("time") or "00:00"
+
+    return {
+        "status":     game["status"]["short"],
+        "home_team":  game["teams"]["home"]["name"],
+        "away_team":  game["teams"]["visitors"]["name"],
+        "home_score": game["scores"]["home"].get("livePoints"),
+        "away_score": game["scores"]["visitors"].get("livePoints"),
+        "game_date":  game_date,
+        "game_time":  game_time,
+        "week":       "",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -74,27 +153,25 @@ def parse_game_results(
     """
     records = []
     for game in raw_games:
-        if game["game"].get("stage") != "Regular Season":
+        fields = _normalize_game(game, sport)
+        if fields is None:
             continue
-        if game["game"]["status"]["short"] == "NS":
+        if fields["status"] == "NS":
             continue
-        home_score = game["scores"]["home"]["total"]
-        away_score = game["scores"]["away"]["total"]
-        if home_score is None or away_score is None:
+        if fields["home_score"] is None or fields["away_score"] is None:
             continue
 
-        home_team = game["teams"]["home"]["name"]
-        away_team = game["teams"]["away"]["name"]
-        game_date = game["game"]["date"]["date"]
-        period = _extract_period(game, sport)
+        home_score = int(fields["home_score"])
+        away_score = int(fields["away_score"])
+        period = _extract_period(fields, sport)
 
         for team, opp, score, opp_score in (
-            (home_team, away_team, int(home_score), int(away_score)),
-            (away_team, home_team, int(away_score), int(home_score)),
+            (fields["home_team"], fields["away_team"], home_score, away_score),
+            (fields["away_team"], fields["home_team"], away_score, home_score),
         ):
             records.append({
                 "sport": sport.name, "team": team, "opponent": opp,
-                "season": season, "period": period, "date": game_date,
+                "season": season, "period": period, "date": fields["game_date"],
                 "score": score, "opp_score": opp_score, "diff": score - opp_score,
             })
 
@@ -103,17 +180,17 @@ def parse_game_results(
 
     df = pd.DataFrame(records)
     if sport.name == "nba":
-        # NBA has no week numbers — assign sequential game number per team by date.
+        # Assign sequential game numbers per team, ordered by date
         df = df.sort_values("date")
         df["period"] = df.groupby("team").cumcount() + 1
     return df.reset_index(drop=True)
 
 
-def _extract_period(game: dict, sport: SportConfig) -> int | None:
-    """NFL: parse week number from 'Week N' string. NBA: assigned post-sort."""
+def _extract_period(fields: dict, sport: SportConfig) -> int | None:
+    """NFL: parse week number from 'Week N'. NBA: assigned post-sort, returns None."""
     if sport.name == "nfl":
         try:
-            return int(game["game"].get("week", "").split(" ")[1])
+            return int(fields["week"].split(" ")[1])
         except (IndexError, ValueError):
             return None
     return None
@@ -124,30 +201,32 @@ def get_upcoming_dates(
     sport: SportConfig,
     next_period: int,
 ) -> list[str]:
-    """Return ISO datetime strings for unplayed games in the upcoming period."""
-    if sport.name == "nfl":
-        next_week_str = f"Week {next_period}"
-        dates = [
-            game["game"]["date"]["date"] + "T" + game["game"]["date"]["time"] + ":00Z"
-            for game in raw_games
-            if game["game"].get("week") == next_week_str
-            and game["game"]["status"]["short"] == "NS"
-        ]
-        return list(set(dates))
+    """
+    Return ISO datetime strings for unplayed games in the upcoming period.
 
-    # NBA: next date with unstarted regular-season games
-    unplayed = [
-        g for g in raw_games
-        if g["game"]["status"]["short"] == "NS"
-        and g["game"].get("stage") == "Regular Season"
-    ]
-    if not unplayed:
+    NFL : games matching 'Week {next_period}' that haven't started yet.
+    NBA : all unstarted regular-season games on the next available date.
+    """
+    upcoming = []
+    for game in raw_games:
+        fields = _normalize_game(game, sport)
+        if fields is None or fields["status"] != "NS":
+            continue
+
+        if sport.name == "nfl":
+            if fields["week"] == f"Week {next_period}":
+                upcoming.append(f"{fields['game_date']}T{fields['game_time']}:00Z")
+        else:
+            upcoming.append((fields["game_date"], f"{fields['game_date']}T{fields['game_time']}:00Z"))
+
+    if sport.name == "nfl":
+        return list(set(upcoming))
+
+    # NBA: return only games on the earliest upcoming date
+    if not upcoming:
         return []
-    next_date = min(g["game"]["date"]["date"] for g in unplayed)
-    return [
-        g["game"]["date"]["date"] + "T" + g["game"]["date"]["time"] + ":00Z"
-        for g in unplayed if g["game"]["date"]["date"] == next_date
-    ]
+    next_date = min(d for d, _ in upcoming)
+    return list(set(dt for d, dt in upcoming if d == next_date))
 
 
 # ---------------------------------------------------------------------------
