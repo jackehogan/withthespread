@@ -4,11 +4,16 @@ and prediction.
 
 Feature design
 --------------
-Rolling point-differential (diff = score - opp_score) is used as the feature
-matrix because it is available for ~100% of games. SpreadScore
-(diff + spread_line) is only available for ~67% of games and was the original
-feature, limiting training rows to ~84.  Using diff as features while keeping
-SpreadScore as the target gives ~50x more training samples.
+Rolling SpreadScore (diff + spread_line) is used as the feature matrix.
+SpreadScore captures performance-vs-expectations, which is the signal most
+relevant to future spread coverage. About 67% of games have a spread line,
+so roughly 33% of feature cells are NaN. XGBoost handles NaN natively by
+learning the optimal default split direction — missing values are informative,
+not discarded.
+
+Only the TARGET period requires a non-NaN SpreadScore (needed for the label).
+Feature periods allow NaN, giving ~2,800 training rows vs 84 when all
+periods were required to have SpreadScore.
 
 Targets
 -------
@@ -63,40 +68,39 @@ def build_features(
     """
     Build train/test/validation splits from long-format historical game data.
 
-    Feature matrix  : rolling `diff` (point differential) — ~100% coverage.
-    Target          : `spreadscore` at the target period — ~67% coverage.
+    Feature matrix  : rolling `spreadscore` — NaN allowed in feature periods,
+                      XGBoost handles missing values natively.
+    Target          : `spreadscore` at the target period — must be non-NaN.
 
-    Only the target period requires spreadscore; feature periods only need
-    diff, so vastly more sliding windows are valid.
+    Only the target period requires a spread line; feature periods with
+    missing SpreadScore contribute NaN cells rather than being discarded,
+    giving ~33x more training rows than requiring all periods to have spreads.
 
     Parameters
     ----------
-    games_df         : columns team, season, period, diff, spreadscore
+    games_df         : columns team, season, period, spreadscore
     next_period      : the period to predict; windows end before it
-    lookback         : number of prior diff values used as features
+    lookback         : number of prior spreadscore values used as features
     validation_season: season held out entirely from train/test split
 
     Returns
     -------
     X_train, X_test, y_train, y_test, X_val, y_val
     """
-    # Feature pivot: diff (highly available)
-    df_feat = games_df[["team", "season", "period", "diff"]].dropna()
-    feat_pivot = df_feat.pivot_table(
-        index=["team", "season"], columns="period", values="diff"
-    )
-
-    # Target pivot: spreadscore (required only at the target period)
-    df_tgt = games_df[["team", "season", "period", "spreadscore"]].dropna()
-    tgt_pivot = df_tgt.pivot_table(
+    # Single spreadscore pivot — NaN allowed in feature cells, required at target.
+    df_ss = games_df[["team", "season", "period", "spreadscore"]]
+    # Keep all rows so NaN features are preserved; pivot fills missing with NaN.
+    ss_pivot = df_ss.pivot_table(
         index=["team", "season"], columns="period", values="spreadscore"
     )
 
-    is_val = feat_pivot.index.get_level_values("season") == validation_season
-    feat_train = feat_pivot[~is_val]
-    feat_val = feat_pivot[is_val]
-    tgt_train = tgt_pivot.reindex(feat_train.index)
-    tgt_val = tgt_pivot.reindex(feat_val.index)
+    is_val = ss_pivot.index.get_level_values("season") == validation_season
+    feat_train = ss_pivot[~is_val]
+    feat_val = ss_pivot[is_val]
+    # Target pivot is the same table — _collect_window will dropna on the
+    # target column only.
+    tgt_train = feat_train
+    tgt_val = feat_val
 
     X_parts, y_parts, Xv_parts, yv_parts = [], [], [], []
     for start in range(1, next_period - lookback + 1):
@@ -145,8 +149,11 @@ def _collect_window(
     """
     Append one sliding-window sample to X_out / y_out.
 
-    Features come from feat_pivot (diff); target from tgt_pivot (spreadscore).
-    Rows are kept only when both feature cols and the target are present.
+    Features come from feat_pivot (spreadscore, NaN allowed).
+    Target comes from tgt_pivot (spreadscore, must be non-NaN).
+
+    NaN feature cells are left in place — XGBoost learns the optimal
+    default split direction for missing values rather than discarding rows.
     """
     if target not in tgt_pivot.columns:
         return
@@ -154,15 +161,15 @@ def _collect_window(
     if len(feature_cols) < lookback:
         return
 
-    # Target: require non-NaN spreadscore
+    # Target: require non-NaN spreadscore at the target period only
     y = tgt_pivot[target].dropna()
     if y.empty:
         return
 
-    # Features: require all lookback diff values
+    # Features: allow NaN — do NOT call dropna() on X
     common_idx = feat_pivot.index.intersection(y.index)
-    X = feat_pivot[feature_cols].loc[common_idx].dropna()
-    y = y.loc[X.index]
+    X = feat_pivot[feature_cols].loc[common_idx]
+    y = y.loc[common_idx]
     if X.empty:
         return
 
@@ -184,15 +191,15 @@ def build_prediction_features(
     season: int,
 ) -> pd.DataFrame:
     """
-    Build the prediction feature matrix using the last `lookback` diff values
-    per team. Teams with fewer completed periods get NaN-padded features
-    (XGBoost handles missing values natively).
+    Build the prediction feature matrix using the last `lookback` spreadscore
+    values per team. Missing spread lines produce NaN cells, which XGBoost
+    handles natively. Teams with fewer completed periods are NaN-padded.
     """
-    completed = season_games[season_games["period"] < next_period].dropna(subset=["diff"])
+    completed = season_games[season_games["period"] < next_period]
     if completed.empty:
         return pd.DataFrame()
 
-    pivot = completed.pivot_table(index="team", columns="period", values="diff")
+    pivot = completed.pivot_table(index="team", columns="period", values="spreadscore")
     available = min(lookback, pivot.shape[1])
     X = pivot.iloc[:, -available:].copy()
 
