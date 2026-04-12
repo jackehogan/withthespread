@@ -103,6 +103,13 @@ def _normalize_game(game: dict, sport: SportConfig) -> dict | None:
     if stage and stage in _NON_REGULAR_STAGES["nba"]:
         return None
 
+    # All-Star / celebrity games also have stage=null — filter by team allowlist.
+    if sport.known_teams is not None:
+        home = game["teams"]["home"]["name"]
+        away = game["teams"]["away"]["name"]
+        if home not in sport.known_teams or away not in sport.known_teams:
+            return None
+
     # game["date"] is an ISO string e.g. "2024-10-04T16:00:00+00:00"
     date_raw = game.get("date") or ""
     game_date = date_raw[:10] if date_raw else ""

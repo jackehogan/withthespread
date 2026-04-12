@@ -38,6 +38,11 @@ class SportConfig:
     regular_season_start: tuple[int, int] | None = None
     regular_season_end: tuple[int, int] | None = None
 
+    # If set, only games where BOTH teams are in this set are kept.
+    # Used to exclude All-Star / celebrity games that share stage=None with
+    # regular-season games and cannot be filtered by stage or date alone.
+    known_teams: frozenset | None = None
+
     def format_season(self, year: int) -> str:
         """Return the season string expected by api-sports.io."""
         if "{year+1}" in self.api_sports_season_fmt:
@@ -67,6 +72,20 @@ NBA = SportConfig(
     # Oct 16 safely excludes preseason; Apr 15 safely excludes playoffs.
     regular_season_start=(10, 16),
     regular_season_end=(4, 15),
+    # All 30 franchises. Games involving All-Star/celebrity teams (stage=None,
+    # same as regular season) are filtered out by this allowlist.
+    known_teams=frozenset({
+        "Atlanta Hawks", "Boston Celtics", "Brooklyn Nets",
+        "Charlotte Hornets", "Chicago Bulls", "Cleveland Cavaliers",
+        "Dallas Mavericks", "Denver Nuggets", "Detroit Pistons",
+        "Golden State Warriors", "Houston Rockets", "Indiana Pacers",
+        "Los Angeles Clippers", "Los Angeles Lakers", "Memphis Grizzlies",
+        "Miami Heat", "Milwaukee Bucks", "Minnesota Timberwolves",
+        "New Orleans Pelicans", "New York Knicks", "Oklahoma City Thunder",
+        "Orlando Magic", "Philadelphia 76ers", "Phoenix Suns",
+        "Portland Trail Blazers", "Sacramento Kings", "San Antonio Spurs",
+        "Toronto Raptors", "Utah Jazz", "Washington Wizards",
+    }),
 )
 
 SPORTS: dict[str, SportConfig] = {

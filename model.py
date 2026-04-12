@@ -2,17 +2,24 @@
 Machine-learning layer: feature engineering, hyperparameter tuning, training,
 and prediction.
 
-The core concept is sport-agnostic: the model's only inputs are a team's last
-N SpreadScore values (SpreadScore = point_diff + spread_line) plus categorical
-identifiers (team, season, period). Both the regression (how much will they
-cover by?) and classification (will they cover?) models share the same feature
-set and training procedure.
+Feature design
+--------------
+Rolling point-differential (diff = score - opp_score) is used as the feature
+matrix because it is available for ~100% of games. SpreadScore
+(diff + spread_line) is only available for ~67% of games and was the original
+feature, limiting training rows to ~84.  Using diff as features while keeping
+SpreadScore as the target gives ~50x more training samples.
+
+Targets
+-------
+  Regression    : predict SpreadScore for the upcoming period
+  Classification: predict whether SpreadScore > 0 (team covers the spread)
 
 Note on sign inversion
 ----------------------
 Empirically the raw predictions are systematically in the wrong direction.
-Both outputs are negated before being returned by predict() until the root
-cause is resolved.
+Both outputs are negated before being returned by predict().  Re-evaluate
+after accumulating more labelled data.
 
 Public interface
 ----------------
@@ -56,32 +63,46 @@ def build_features(
     """
     Build train/test/validation splits from long-format historical game data.
 
-    Slides a window of size `lookback` across all completed periods, producing
-    one sample per (team, season, window). The validation season is held out
-    entirely from the train/test split.
+    Feature matrix  : rolling `diff` (point differential) — ~100% coverage.
+    Target          : `spreadscore` at the target period — ~67% coverage.
+
+    Only the target period requires spreadscore; feature periods only need
+    diff, so vastly more sliding windows are valid.
 
     Parameters
     ----------
-    games_df         : must contain columns team, season, period, spreadscore
-    next_period      : the period we want to predict; windows stop before it
-    lookback         : number of prior periods used as features (tunable)
-    validation_season: season held out for evaluation
+    games_df         : columns team, season, period, diff, spreadscore
+    next_period      : the period to predict; windows end before it
+    lookback         : number of prior diff values used as features
+    validation_season: season held out entirely from train/test split
 
     Returns
     -------
     X_train, X_test, y_train, y_test, X_val, y_val
     """
-    df = games_df[["team", "season", "period", "spreadscore"]].dropna()
-    pivot = df.pivot_table(index=["team", "season"], columns="period", values="spreadscore")
+    # Feature pivot: diff (highly available)
+    df_feat = games_df[["team", "season", "period", "diff"]].dropna()
+    feat_pivot = df_feat.pivot_table(
+        index=["team", "season"], columns="period", values="diff"
+    )
 
-    is_val = pivot.index.get_level_values("season") == validation_season
-    train_pivot, val_pivot = pivot[~is_val], pivot[is_val]
+    # Target pivot: spreadscore (required only at the target period)
+    df_tgt = games_df[["team", "season", "period", "spreadscore"]].dropna()
+    tgt_pivot = df_tgt.pivot_table(
+        index=["team", "season"], columns="period", values="spreadscore"
+    )
+
+    is_val = feat_pivot.index.get_level_values("season") == validation_season
+    feat_train = feat_pivot[~is_val]
+    feat_val = feat_pivot[is_val]
+    tgt_train = tgt_pivot.reindex(feat_train.index)
+    tgt_val = tgt_pivot.reindex(feat_val.index)
 
     X_parts, y_parts, Xv_parts, yv_parts = [], [], [], []
     for start in range(1, next_period - lookback + 1):
         target = start + lookback
-        _collect_window(train_pivot, start, lookback, target, X_parts, y_parts)
-        _collect_window(val_pivot, start, lookback, target, Xv_parts, yv_parts)
+        _collect_window(feat_train, tgt_train, start, lookback, target, X_parts, y_parts)
+        _collect_window(feat_val, tgt_val, start, lookback, target, Xv_parts, yv_parts)
 
     if not X_parts:
         raise ValueError(
@@ -90,18 +111,13 @@ def build_features(
         )
 
     X = pd.concat(X_parts, ignore_index=True)
-    # Re-cast after concat: mismatched category sets collapse to object
-    for col in _CAT_COLS:
-        if col in X.columns:
-            X[col] = X[col].astype("category")
+    _recast_categoricals(X)
     y = pd.concat(y_parts, ignore_index=True).astype(float)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, random_state=42)
 
     if Xv_parts:
         X_val = pd.concat(Xv_parts, ignore_index=True)
-        for col in _CAT_COLS:
-            if col in X_val.columns:
-                X_val[col] = X_val[col].astype("category")
+        _recast_categoricals(X_val)
         y_val = pd.concat(yv_parts, ignore_index=True).astype(float)
     else:
         X_val = pd.DataFrame(columns=X.columns)
@@ -110,22 +126,42 @@ def build_features(
     return X_train, X_test, y_train, y_test, X_val, y_val
 
 
+def _recast_categoricals(df: pd.DataFrame) -> None:
+    """Re-cast _CAT_COLS to category dtype in-place (lost after pd.concat)."""
+    for col in _CAT_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+
+
 def _collect_window(
-    pivot: pd.DataFrame,
+    feat_pivot: pd.DataFrame,
+    tgt_pivot: pd.DataFrame,
     start: int,
     lookback: int,
     target: int,
     X_out: list,
     y_out: list,
 ) -> None:
-    """Append one sliding-window sample to X_out / y_out if data is available."""
-    if target not in pivot.columns:
+    """
+    Append one sliding-window sample to X_out / y_out.
+
+    Features come from feat_pivot (diff); target from tgt_pivot (spreadscore).
+    Rows are kept only when both feature cols and the target are present.
+    """
+    if target not in tgt_pivot.columns:
         return
-    feature_cols = [c for c in range(start, start + lookback) if c in pivot.columns]
+    feature_cols = [c for c in range(start, start + lookback) if c in feat_pivot.columns]
     if len(feature_cols) < lookback:
         return
-    y = pivot[target].dropna()
-    X = pivot[feature_cols].loc[y.index].dropna()
+
+    # Target: require non-NaN spreadscore
+    y = tgt_pivot[target].dropna()
+    if y.empty:
+        return
+
+    # Features: require all lookback diff values
+    common_idx = feat_pivot.index.intersection(y.index)
+    X = feat_pivot[feature_cols].loc[common_idx].dropna()
     y = y.loc[X.index]
     if X.empty:
         return
@@ -133,8 +169,7 @@ def _collect_window(
     df = X.copy().reset_index()
     df = df.rename(columns={col: f"{lookback - i}_ago" for i, col in enumerate(feature_cols)})
     df["period"] = target
-    for col in _CAT_COLS:
-        df[col] = df[col].astype("category")
+    _recast_categoricals(df)
     for col in df.columns:
         if col not in _CAT_COLS:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -149,15 +184,15 @@ def build_prediction_features(
     season: int,
 ) -> pd.DataFrame:
     """
-    Build the prediction feature matrix using the last `lookback` completed
-    periods per team. Teams with fewer periods get NaN-padded features
+    Build the prediction feature matrix using the last `lookback` diff values
+    per team. Teams with fewer completed periods get NaN-padded features
     (XGBoost handles missing values natively).
     """
-    completed = season_games[season_games["period"] < next_period]
+    completed = season_games[season_games["period"] < next_period].dropna(subset=["diff"])
     if completed.empty:
         return pd.DataFrame()
 
-    pivot = completed.pivot_table(index="team", columns="period", values="spreadscore")
+    pivot = completed.pivot_table(index="team", columns="period", values="diff")
     available = min(lookback, pivot.shape[1])
     X = pivot.iloc[:, -available:].copy()
 
@@ -168,8 +203,7 @@ def build_prediction_features(
     X = X.reset_index()
     X["season"] = season
     X["period"] = next_period
-    for col in _CAT_COLS:
-        X[col] = X[col].astype("category")
+    _recast_categoricals(X)
     for col in X.columns:
         if col not in _CAT_COLS:
             X[col] = pd.to_numeric(X[col], errors="coerce")
@@ -220,7 +254,7 @@ def train_models(
 
     Returns
     -------
-    reg    : fitted XGBRegressor (predicts SpreadScore)
+    reg    : fitted XGBRegressor (predicts SpreadScore from diff features)
     clas   : fitted XGBClassifier (predicts cover probability)
     scores : dict of train/test/val evaluation metrics
     """
