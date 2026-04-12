@@ -98,21 +98,23 @@ def _normalize_game(game: dict, sport: SportConfig) -> dict | None:
         }
 
     # Basketball ---------------------------------------------------------------
+    # Regular season games have stage=null; skip known non-regular stages.
     stage = game.get("stage") or ""
     if stage and stage in _NON_REGULAR_STAGES["nba"]:
         return None
 
-    # game["date"] is an ISO string e.g. "2024-10-22T00:00:00.000Z"
+    # game["date"] is an ISO string e.g. "2024-10-04T16:00:00+00:00"
     date_raw = game.get("date") or ""
     game_date = date_raw[:10] if date_raw else ""
     game_time = game.get("time") or "00:00"
 
+    # Structure is the same as football apart from the missing "game" wrapper
     return {
         "status":     game["status"]["short"],
         "home_team":  game["teams"]["home"]["name"],
-        "away_team":  game["teams"]["visitors"]["name"],
-        "home_score": game["scores"]["home"].get("livePoints"),
-        "away_score": game["scores"]["visitors"].get("livePoints"),
+        "away_team":  game["teams"]["away"]["name"],
+        "home_score": game["scores"]["home"]["total"],
+        "away_score": game["scores"]["away"]["total"],
         "game_date":  game_date,
         "game_time":  game_time,
         "week":       "",
