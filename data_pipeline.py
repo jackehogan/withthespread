@@ -122,6 +122,8 @@ def _normalize_game(game: dict, sport: SportConfig) -> dict | None:
         "away_team":  game["teams"]["away"]["name"],
         "home_score": game["scores"]["home"]["total"],
         "away_score": game["scores"]["away"]["total"],
+        "home_q4":    game["scores"]["home"].get("quarter_4"),
+        "away_q4":    game["scores"]["away"].get("quarter_4"),
         "game_date":  game_date,
         "game_time":  game_time,
         "week":       "",
@@ -174,14 +176,22 @@ def parse_game_results(
         away_score = int(fields["away_score"])
         period = _extract_period(fields, sport)
 
-        for team, opp, score, opp_score in (
-            (fields["home_team"], fields["away_team"], home_score, away_score),
-            (fields["away_team"], fields["home_team"], away_score, home_score),
+        home_q4 = fields.get("home_q4")
+        away_q4 = fields.get("away_q4")
+        q4_available = home_q4 is not None and away_q4 is not None
+        home_q4_i = int(home_q4) if q4_available else None
+        away_q4_i = int(away_q4) if q4_available else None
+
+        for team, opp, score, opp_score, is_home, q4, opp_q4 in (
+            (fields["home_team"], fields["away_team"], home_score, away_score, True,  home_q4_i, away_q4_i),
+            (fields["away_team"], fields["home_team"], away_score, home_score, False, away_q4_i, home_q4_i),
         ):
             records.append({
                 "sport": sport.name, "team": team, "opponent": opp,
                 "season": season, "period": period, "date": fields["game_date"],
                 "score": score, "opp_score": opp_score, "diff": score - opp_score,
+                "home": is_home,
+                "q4_diff": (q4 - opp_q4) if q4 is not None else None,
             })
 
     if not records:
@@ -291,7 +301,7 @@ def fetch_historical_spreads(
     r = requests.get(
         f"https://api.the-odds-api.com/v4/historical/sports"
         f"/{sport.odds_api_sport}/odds"
-        f"?apiKey={cfg['spreads']['key_paid']}&regions=us&markets=spreads"
+        f"?apiKey={cfg['spreads']['key_paid']}&regions=us&markets=h2h,spreads,totals"
         f"&oddsFormat=american&date={snapshot}"
     )
     r.raise_for_status()
@@ -328,7 +338,7 @@ def fetch_upcoming_spreads(
     if key_type == "free":
         r = requests.get(
             f"https://api.the-odds-api.com/v4/sports/{sport.odds_api_sport}/odds"
-            f"?regions=us&markets=spreads&oddsFormat=american&apiKey={api_key}"
+            f"?regions=us&markets=h2h,spreads,totals&oddsFormat=american&apiKey={api_key}"
         )
         r.raise_for_status()
         data = r.json()
@@ -338,7 +348,7 @@ def fetch_upcoming_spreads(
         r = requests.get(
             f"https://api.the-odds-api.com/v4/historical/sports"
             f"/{sport.odds_api_sport}/odds"
-            f"?apiKey={api_key}&regions=us&markets=spreads"
+            f"?apiKey={api_key}&regions=us&markets=h2h,spreads,totals"
             f"&oddsFormat=american&date={min(dates)}"
         )
         r.raise_for_status()
@@ -365,27 +375,92 @@ def fetch_upcoming_spreads(
     return _parse_spreads(data)
 
 
+def _american_to_implied_prob(odds: float) -> float:
+    """Convert American odds to implied probability (0-1), ignoring vig."""
+    if odds >= 0:
+        return 100 / (odds + 100)
+    return abs(odds) / (abs(odds) + 100)
+
+
 def _parse_spreads(spreaddata: list[dict]) -> pd.DataFrame:
-    """Extract spread lines from an Odds API game list into a team-indexed DataFrame."""
-    spreads: dict[str, float] = {}
-    opponents: dict[str, str] = {}
-    order: dict[str, int] = {}
+    """
+    Extract all available market data from an Odds API game list.
+
+    Returns a DataFrame indexed by team with columns:
+        spread          : point spread for this team
+        spread_juice    : juice (price) on the spread for this team
+        total           : over/under line (same for both teams in a game)
+        moneyline       : h2h American odds for this team
+        implied_prob    : win probability implied by moneyline (vig-inclusive)
+        opponent        : opponent team name
+        home            : True if this team is the home team
+        game_date       : YYYY-MM-DD of the game
+        order           : game index (for deduplication)
+    """
+    spreads:       dict[str, float] = {}
+    spread_juice:  dict[str, float] = {}
+    totals:        dict[str, float] = {}
+    moneylines:    dict[str, float] = {}
+    implied_probs: dict[str, float] = {}
+    opponents:     dict[str, str]   = {}
+    order:         dict[str, int]   = {}
+    home_flag:     dict[str, bool]  = {}
+    game_dates:    dict[str, str]   = {}
 
     for i, game in enumerate(spreaddata):
+        home_team = game.get("home_team", "")
+        game_date = game.get("commence_time", "")[:10]
         bookmakers = game.get("bookmakers", [])
         if not bookmakers:
             continue
-        for market in bookmakers[0]["markets"]:
-            if market["key"] != "spreads":
-                continue
-            t0, t1 = market["outcomes"][0]["name"], market["outcomes"][1]["name"]
-            spreads[t0] = market["outcomes"][0]["point"]
-            spreads[t1] = market["outcomes"][1]["point"]
-            opponents[t0], opponents[t1] = t1, t0
-            order[t0] = order[t1] = i
+
+        # Use the first bookmaker that has the most markets
+        bm = max(bookmakers, key=lambda b: len(b["markets"]))
+        markets_by_key = {m["key"]: m for m in bm["markets"]}
+
+        # --- spreads ---
+        if "spreads" in markets_by_key:
+            for outcome in markets_by_key["spreads"]["outcomes"]:
+                t = outcome["name"]
+                spreads[t]      = outcome["point"]
+                spread_juice[t] = outcome.get("price", None)
+                opponents[t]    = ""   # filled below
+                order[t]        = i
+                home_flag[t]    = (t == home_team)
+                game_dates[t]   = game_date
+            outs = markets_by_key["spreads"]["outcomes"]
+            if len(outs) == 2:
+                opponents[outs[0]["name"]] = outs[1]["name"]
+                opponents[outs[1]["name"]] = outs[0]["name"]
+
+        # --- totals (game-level, same for both teams) ---
+        if "totals" in markets_by_key:
+            total_line = next(
+                (o["point"] for o in markets_by_key["totals"]["outcomes"]
+                 if o["name"] == "Over"), None
+            )
+            if total_line is not None:
+                for t in list(spreads):
+                    if game_dates.get(t) == game_date and order.get(t) == i:
+                        totals[t] = total_line
+
+        # --- h2h (moneyline) ---
+        if "h2h" in markets_by_key:
+            for outcome in markets_by_key["h2h"]["outcomes"]:
+                t = outcome["name"]
+                price = outcome.get("price")
+                if price is not None:
+                    moneylines[t]    = price
+                    implied_probs[t] = _american_to_implied_prob(price)
 
     return pd.DataFrame({
-        "spread": pd.Series(spreads),
-        "opponent": pd.Series(opponents),
-        "order": pd.Series(order),
+        "spread":       pd.Series(spreads),
+        "spread_juice": pd.Series(spread_juice),
+        "total":        pd.Series(totals),
+        "moneyline":    pd.Series(moneylines),
+        "implied_prob": pd.Series(implied_probs),
+        "opponent":     pd.Series(opponents),
+        "home":         pd.Series(home_flag),
+        "game_date":    pd.Series(game_dates),
+        "order":        pd.Series(order),
     })

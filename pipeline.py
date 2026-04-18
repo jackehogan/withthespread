@@ -109,10 +109,12 @@ def run(
     if spreads_df.empty:
         print("  No upcoming spreads found.")
     else:
+        _odds_fields = ["spread", "spread_juice", "total", "implied_prob"]
         db.upsert_games(client, [
             {
                 "sport": sport.name, "team": team, "opponent": row["opponent"],
-                "season": season, "period": next_period, "spread": float(row["spread"]),
+                "season": season, "period": next_period,
+                **{f: float(row[f]) for f in _odds_fields if f in row and pd.notna(row[f])},
             }
             for team, row in spreads_df.iterrows()
         ])
@@ -121,7 +123,7 @@ def run(
     # Step 3: build features and train
     print("[3/4] Building features and training models...")
     all_games = _fetch_games_filtered(client, sport)
-    reg, clas, scores, best_lookback = ml.train_models(
+    reg, sigma_diff, scores, best_lookback, best_k, style_model = ml.train_models(
         all_games, next_period, sport.eval_season, sport.eval_split_period, max_evals
     )
     print(f"  Scores: {scores}")
@@ -129,12 +131,33 @@ def run(
     # Step 4: generate and store predictions
     print("[4/4] Generating predictions...")
     season_games = _fetch_games_filtered(client, sport, season)
-    X_pred = ml.build_prediction_features(season_games, next_period, best_lookback, season)
+
+    # Build upcoming context for the next period
+    upcoming_context = None
+    if not spreads_df.empty and "game_date" in spreads_df.columns:
+        last_dates = season_games.groupby("team")["date"].max()
+        ctx_cols = ["home", "game_date", "spread", "spread_juice", "total", "implied_prob"]
+        uc = spreads_df[[c for c in ctx_cols if c in spreads_df.columns]].copy()
+        rest = (
+            pd.to_datetime(uc["game_date"]) -
+            pd.to_datetime(uc.index.map(last_dates))
+        ).dt.days
+        uc["is_b2b"] = (rest == 1).astype(float)
+        upcoming_context = uc.drop(columns=["game_date"])
+
+    X_pred = ml.build_prediction_features(
+        season_games, next_period, best_lookback, season, upcoming_context, style_model, best_k
+    )
     if X_pred.empty:
         print("  Not enough season data to predict.")
         return pd.DataFrame()
 
-    preds = ml.predict(reg, clas, X_pred)
+    opponent_map = (
+        upcoming_context["opponent"].to_dict()
+        if upcoming_context is not None and "opponent" in upcoming_context.columns
+        else None
+    )
+    preds = ml.predict(reg, sigma_diff, X_pred, opponent_map)
 
     if not spreads_df.empty:
         pred_df = preds.join(spreads_df[["opponent", "spread"]], how="left")
