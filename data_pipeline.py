@@ -30,6 +30,7 @@ fetch_upcoming_spreads(sport, dates, key_type) -> pd.DataFrame
 import datetime
 import http.client
 import json
+import time
 
 import pandas as pd
 import requests
@@ -464,3 +465,70 @@ def _parse_spreads(spreaddata: list[dict]) -> pd.DataFrame:
         "game_date":    pd.Series(game_dates),
         "order":        pd.Series(order),
     })
+
+
+# ---------------------------------------------------------------------------
+# NBA advanced ratings — nba_api (free, no credits)
+# ---------------------------------------------------------------------------
+
+# Season format mapping: DB season year (start year) -> nba_api season string
+def _nba_season_str(season: int) -> str:
+    """Convert DB season year (e.g. 2024) to nba_api format (e.g. '2024-25')."""
+    return f"{season}-{str(season + 1)[-2:]}"
+
+
+def fetch_nba_ratings(season: int, date_to: str | None = None) -> pd.DataFrame:
+    """
+    Fetch cumulative advanced team ratings from stats.nba.com.
+
+    Uses LeagueDashTeamStats with measure_type='Advanced'. If date_to is
+    provided (YYYY-MM-DD), returns ratings accumulated only through that date,
+    giving a pre-period snapshot with no leakage.
+
+    Parameters
+    ----------
+    season    : Season start year (e.g. 2024 for 2024-25)
+    date_to   : Optional cutoff date string 'YYYY-MM-DD'. If None, uses
+                all available games for the season.
+
+    Returns
+    -------
+    DataFrame indexed by team name with columns:
+        off_rating, def_rating, net_rating
+    Returns empty DataFrame on failure.
+    """
+    try:
+        from nba_api.stats.endpoints import LeagueDashTeamStats
+    except ImportError:
+        print("  nba_api not installed. Run: pip install nba_api")
+        return pd.DataFrame()
+
+    kwargs: dict = {
+        "season":                      _nba_season_str(season),
+        "measure_type_detailed_defense": "Advanced",
+        "per_mode_detailed":           "PerGame",
+    }
+    if date_to is not None:
+        # nba_api expects MM/DD/YYYY
+        try:
+            dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
+            kwargs["date_to_nullable"] = dt.strftime("%m/%d/%Y")
+        except ValueError:
+            pass
+
+    try:
+        df = LeagueDashTeamStats(**kwargs).get_data_frames()[0]
+    except Exception as exc:
+        print(f"  fetch_nba_ratings failed ({exc})")
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    keep = {"TEAM_NAME": "team", "E_OFF_RATING": "off_rating",
+            "E_DEF_RATING": "def_rating", "E_NET_RATING": "net_rating"}
+    df = df[list(keep)].rename(columns=keep).set_index("team")
+
+    # Drop rows with no data (teams with 0 games played in range)
+    df = df.dropna(subset=["off_rating", "def_rating"])
+    return df

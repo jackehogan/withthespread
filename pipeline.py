@@ -101,6 +101,15 @@ def run(
     db.upsert_games(client, fresh.to_dict("records"))
     print(f"  Upserted {len(fresh)} game rows.")
 
+    # Step 1b: fetch and attach current-season ratings to next_period rows (NBA only)
+    ratings_df = pd.DataFrame()
+    if sport.name == "nba":
+        last_played = str(fresh["date"].max())[:10] if "date" in fresh.columns and not fresh["date"].isna().all() else None
+        ratings_df = dp.fetch_nba_ratings(season, last_played)
+        if not ratings_df.empty:
+            n_rated = db.upsert_game_ratings(client, sport.name, season, next_period, ratings_df)
+            print(f"  Ratings upserted for {n_rated} teams (as of {last_played}).")
+
     # Step 2: fetch and store upcoming spreads
     print(f"[2/4] Fetching upcoming spreads (key_type={key_type})...")
     dates = dp.get_upcoming_dates(raw_games, sport, next_period)
@@ -143,7 +152,23 @@ def run(
             pd.to_datetime(uc.index.map(last_dates))
         ).dt.days
         uc["is_b2b"] = (rest == 1).astype(float)
-        upcoming_context = uc.drop(columns=["game_date"])
+        uc = uc.drop(columns=["game_date"])
+
+        # Attach current ratings + opponent matchup features to upcoming context
+        if sport.name == "nba" and not ratings_df.empty:
+            for col in ["off_rating", "def_rating", "net_rating"]:
+                if col in ratings_df.columns:
+                    uc[col] = uc.index.map(ratings_df[col])
+
+            # Opponent matchup: look up opponent's ratings from ratings_df
+            if "opponent" in uc.columns:
+                uc["opp_off_rating"] = uc["opponent"].map(ratings_df.get("off_rating", pd.Series(dtype=float)))
+                uc["opp_def_rating"] = uc["opponent"].map(ratings_df.get("def_rating", pd.Series(dtype=float)))
+                if "off_rating" in uc.columns and "opp_def_rating" in uc.columns:
+                    uc["matchup_off_edge"] = uc["off_rating"] - uc["opp_def_rating"]
+                    uc["matchup_def_edge"] = uc["def_rating"] - uc["opp_off_rating"]
+
+        upcoming_context = uc
 
     X_pred = ml.build_prediction_features(
         season_games, next_period, best_lookback, season, upcoming_context, style_model, best_k

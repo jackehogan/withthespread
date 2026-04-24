@@ -61,12 +61,13 @@ def run_backtest(
             )
 
             # Build upcoming_context from actual game data for this period.
-            # Populates home, is_b2b, spread, opponent — same as live prediction time.
+            # Populates home, is_b2b, spread, opponent, ratings — same as live prediction time.
             period_rows = season_games[season_games["period"] == period]
             if not period_rows.empty:
-                uc = period_rows.set_index("team")[
-                    [c for c in ["home", "spread", "opponent", "date"] if c in period_rows.columns]
-                ].copy()
+                ctx_cols = [c for c in ["home", "spread", "opponent", "date",
+                                        "off_rating", "def_rating", "net_rating"]
+                            if c in period_rows.columns]
+                uc = period_rows.set_index("team")[ctx_cols].copy()
                 if "date" in uc.columns:
                     prev_rows = season_games[season_games["period"] < period]
                     last_date = prev_rows.groupby("team")["date"].max()
@@ -78,6 +79,14 @@ def run_backtest(
                     uc = uc.drop(columns=["date"])
                 else:
                     uc["is_b2b"] = np.nan
+
+                # Opponent matchup features from stored ratings
+                if "opponent" in uc.columns and "off_rating" in uc.columns:
+                    uc["opp_off_rating"] = uc["opponent"].map(uc["off_rating"])
+                    uc["opp_def_rating"] = uc["opponent"].map(uc["def_rating"])
+                    uc["matchup_off_edge"] = uc["off_rating"] - uc["opp_def_rating"]
+                    uc["matchup_def_edge"] = uc["def_rating"] - uc["opp_off_rating"]
+
                 upcoming_context = uc
             else:
                 upcoming_context = None
@@ -109,6 +118,13 @@ def run_backtest(
         merged["lb"]         = best_lookback
         merged["elo_k"]      = best_k
         merged["sigma_diff"] = round(sigma_diff, 3)
+
+        # Attach context cols (home, spread, is_b2b) for error analysis
+        if upcoming_context is not None:
+            for col in ["home", "spread", "is_b2b"]:
+                if col in upcoming_context.columns:
+                    merged[col] = merged.index.map(upcoming_context[col])
+
         records.append(merged)
 
         # Per-period diagnostics (includes full scores dict from train_models)
@@ -136,12 +152,10 @@ def run_backtest(
             "sigma_source":  scores.get("sigma_source"),
         })
 
-        # Feature matrix — indexed by team, tagged with period for joining later
+        # Feature matrix — team column already present from build_prediction_features
         feat_frame = X_pred.copy()
         feat_frame["period"] = period
-        feat_frame = feat_frame.drop(columns=["team"], errors="ignore")
-        feat_frame.index.name = "team"
-        feat_records.append(feat_frame.reset_index())
+        feat_records.append(feat_frame)
 
         print(f"  Period {period:3d}: {n:2d} teams, lb={best_lookback}, "
               f"acc={acc:.3f}, coverprob [{cp_min:.3f}, {cp_max:.3f}]  "

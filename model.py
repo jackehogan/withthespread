@@ -457,25 +457,38 @@ def _recast_categoricals(df: pd.DataFrame) -> None:
 def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute per-(team, season, period) context features:
-      home   : 1 if playing at home, 0 if away
-      is_b2b : 1 if the team played yesterday (rest_days == 1), else 0
-      spread : the game spread line for this team (NaN if unavailable)
+      home              : 1 if playing at home, 0 if away
+      is_b2b            : 1 if the team played yesterday, else 0
+      spread            : game spread line (NaN if unavailable)
+      off_rating        : team's cumulative offensive rating through prior period
+      def_rating        : team's cumulative defensive rating through prior period
+      net_rating        : team's cumulative net rating through prior period
+      opp_off_rating    : opponent's off_rating (same period)
+      opp_def_rating    : opponent's def_rating (same period)
+      matchup_off_edge  : team off_rating - opp def_rating (offensive advantage)
+      matchup_def_edge  : team def_rating - opp off_rating (defensive advantage, lower = better)
 
     Returns a DataFrame indexed by (team, season, period).
     """
     # spread_juice, total, implied_prob excluded until historical odds are backfilled
-    _CTX_ODDS = ["spread"]
+    # off_rating / def_rating / net_rating populated once nba_api ratings are seeded
+    _RATING_COLS = ["off_rating", "def_rating", "net_rating"]
+    _CTX_ODDS    = ["spread"] + _RATING_COLS
 
     needed = {"team", "season", "period", "date", "home"}
+    _matchup_cols = ["opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge"]
+    _all_out = ["home", "is_b2b"] + _CTX_ODDS + _matchup_cols
+
     if not needed.issubset(games_df.columns):
         idx = pd.MultiIndex.from_frame(games_df[["team", "season", "period"]])
-        return pd.DataFrame(
-            {"home": np.nan, "is_b2b": np.nan, **{c: np.nan for c in _CTX_ODDS}},
-            index=idx,
-        )
+        return pd.DataFrame({c: np.nan for c in _all_out}, index=idx)
 
     odds_present = [c for c in _CTX_ODDS if c in games_df.columns]
+    opp_present  = "opponent" in games_df.columns
+
     cols = ["team", "season", "period", "date", "home"] + odds_present
+    if opp_present:
+        cols.append("opponent")
 
     df = games_df[cols].copy()
     df = df.sort_values(["team", "season", "period"])
@@ -488,9 +501,33 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
 
-    return df.set_index(["team", "season", "period"])[
-        ["home", "is_b2b"] + _CTX_ODDS
-    ]
+    # --- Opponent matchup features ---
+    # Build a lookup: (team, season, period) -> off_rating, def_rating
+    ratings_have = [c for c in ["off_rating", "def_rating"] if c in df.columns]
+    if opp_present and ratings_have:
+        rating_lookup = (
+            df.set_index(["team", "season", "period"])[ratings_have]
+        )
+        # Join opponent ratings by resolving (opponent, season, period)
+        opp_keys = list(zip(df["opponent"], df["season"], df["period"]))
+        opp_ratings = rating_lookup.reindex(opp_keys)
+        opp_ratings.index = df.index
+
+        if "off_rating" in ratings_have:
+            df["opp_off_rating"] = opp_ratings["off_rating"].values
+        if "def_rating" in ratings_have:
+            df["opp_def_rating"] = opp_ratings["def_rating"].values
+
+        # Matchup edges
+        if "off_rating" in ratings_have and "def_rating" in ratings_have:
+            df["matchup_off_edge"] = df["off_rating"] - df["opp_def_rating"]   # positive = offence advantage
+            df["matchup_def_edge"] = df["def_rating"] - df["opp_off_rating"]   # negative = defensive advantage
+    else:
+        for c in _matchup_cols:
+            df[c] = np.nan
+
+    out_cols = [c for c in _all_out if c in df.columns]
+    return df.set_index(["team", "season", "period"])[out_cols]
 
 
 _SS_MEAN_WINDOW  = 5   # fixed rolling window for ss_mean (EDA: 5-8 games optimal)
@@ -615,7 +652,8 @@ def _collect_window(
     df["period"] = target
 
     # --- Context features for the target period ---
-    _CTX_COLS = ["home", "is_b2b", "spread"]
+    _CTX_COLS = ["home", "is_b2b", "spread", "off_rating", "def_rating", "net_rating",
+                 "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge"]
     try:
         ctx_slice   = context.xs(target, level="period")
         ctx_aligned = ctx_slice.reindex(common_idx)
@@ -697,7 +735,8 @@ def build_prediction_features(
 
     # Join context features for the upcoming game
     # spread_juice, total, implied_prob re-added once historical odds are backfilled
-    _CTX_COLS = ["home", "is_b2b", "spread"]
+    _CTX_COLS = ["home", "is_b2b", "spread", "off_rating", "def_rating", "net_rating",
+                 "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge"]
     if upcoming_context is not None and not upcoming_context.empty:
         for col in _CTX_COLS:
             X[col] = X["team"].map(upcoming_context[col]) if col in upcoming_context.columns else np.nan

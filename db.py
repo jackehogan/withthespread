@@ -107,3 +107,42 @@ def upsert_games(client: MongoClient, records: list[dict]) -> None:
 def upsert_predictions(client: MongoClient, records: list[dict]) -> None:
     """Upsert prediction records. Each record must contain all four key fields."""
     _upsert(client[_MONGO_DB]["predictions"], records)
+
+
+def upsert_game_ratings(
+    client: MongoClient,
+    sport: str,
+    season: int,
+    period: int,
+    ratings_df: "pd.DataFrame",
+) -> int:
+    """
+    Merge off_rating / def_rating / net_rating into existing game documents
+    for a specific (sport, season, period).
+
+    ratings_df must be indexed by team name with columns:
+        off_rating, def_rating, net_rating
+
+    Only updates documents that already exist (does not create new ones).
+    Returns the number of documents modified.
+    """
+    if ratings_df.empty:
+        return 0
+
+    col = client[_MONGO_DB]["games"]
+    ops = []
+    rating_cols = [c for c in ["off_rating", "def_rating", "net_rating"] if c in ratings_df.columns]
+    for team, row in ratings_df.iterrows():
+        update = {c: float(row[c]) for c in rating_cols if pd.notna(row[c])}
+        if not update:
+            continue
+        ops.append(UpdateOne(
+            {"sport": sport, "team": team, "season": season, "period": period},
+            {"$set": update},
+            upsert=False,   # only update existing game rows
+        ))
+
+    if not ops:
+        return 0
+    result = col.bulk_write(ops)
+    return result.modified_count
