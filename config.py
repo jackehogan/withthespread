@@ -4,13 +4,17 @@ Sport configurations for the betting prediction pipeline.
 To add a new sport:
   1. Add a SportConfig instance below.
   2. Verify api_sports_host and api_sports_league against api-sports.io docs.
+     Set both to None for sports that use an alternative scores source (e.g.
+     MLB uses statsapi instead of api-sports.io).
   3. Verify odds_api_sport against the-odds-api.com /v4/sports endpoint.
   4. Choose an eval_season (held-out year) and eval_split_period (period that
      divides the eval season into test [before] and val [from]).
   5. Register it in the SPORTS dict.
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -19,11 +23,11 @@ class SportConfig:
 
     # Short identifier stored as the 'sport' field in MongoDB.
     name: str
-    # api-sports.io hostname.
-    api_sports_host: str
-    # League ID on api-sports.io (1 = NFL, 12 = NBA).
-    api_sports_league: int
-    # Season string format: "{year}" for NFL, "{year}-{year+1}" for NBA.
+    # api-sports.io hostname. None for sports using an alternative scores source.
+    api_sports_host: str | None
+    # League ID on api-sports.io. None for sports using an alternative scores source.
+    api_sports_league: int | None
+    # Season string format: "{year}" for NFL/MLB, "{year}-{year+1}" for NBA.
     api_sports_season_fmt: str
     # Sport key for the-odds-api.com.
     odds_api_sport: str
@@ -94,7 +98,57 @@ NBA = SportConfig(
     }),
 )
 
+# ---------------------------------------------------------------------------
+# MLB
+# ---------------------------------------------------------------------------
+# Run lines in baseball are fixed at ±1.5 (juice varies).
+# SpreadScore = run_diff + run_line (same convention as NBA/NFL).
+# Scores fetched from the free statsapi (stats.mlb.com) — no api-sports.io key
+# needed. Historical run lines loaded from local SBR CSV files.
+#
+# Season year = calendar year (e.g. 2023 = the 2023 regular season).
+# Period = sequential game number per team (1-162).
+# Training starts from 2021 (post-COVID). 2020 season was 60 games with
+# temporary rule changes (universal DH, 7-inning doubleheaders) that make it
+# a weak and potentially misleading training signal.
+#
+# Key features not in NBA:
+#   sp_era, sp_whip, sp_k9  — starting pitcher quality (prior-season stats)
+#   opp_sp_era, opp_sp_whip — opponent pitcher
+#   sp_era_edge             — self.sp_era - opp.sp_era  (matchup)
+MLB = SportConfig(
+    name="mlb",
+    api_sports_host=None,         # uses statsapi, not api-sports.io
+    api_sports_league=None,
+    api_sports_season_fmt="{year}",
+    odds_api_sport="baseball_mlb",
+    season_periods=162,
+    eval_season=2023,
+    eval_split_period=81,          # games 1-80 -> test, 81-162 -> val
+    # Opening Day has been as early as March 20 in recent years; World Series
+    # can extend to early November but regular season ends late September.
+    regular_season_start=(3, 20),
+    regular_season_end=(10, 1),
+    known_teams=frozenset({
+        "Arizona Diamondbacks", "Atlanta Braves", "Baltimore Orioles",
+        "Boston Red Sox", "Chicago Cubs", "Chicago White Sox",
+        "Cincinnati Reds", "Cleveland Guardians", "Colorado Rockies",
+        "Detroit Tigers", "Houston Astros", "Kansas City Royals",
+        "Los Angeles Angels", "Los Angeles Dodgers", "Miami Marlins",
+        "Milwaukee Brewers", "Minnesota Twins", "New York Mets",
+        "New York Yankees", "Oakland Athletics", "Philadelphia Phillies",
+        "Pittsburgh Pirates", "San Diego Padres", "San Francisco Giants",
+        "Seattle Mariners", "St. Louis Cardinals", "Tampa Bay Rays",
+        "Texas Rangers", "Toronto Blue Jays", "Washington Nationals",
+        # 2022 rename: Cleveland Indians -> Cleveland Guardians (both kept)
+        "Cleveland Indians",
+        # Athletics played in Oakland through 2024 before relocating
+        "Athletics",
+    }),
+)
+
 SPORTS: dict[str, SportConfig] = {
     "nfl": NFL,
     "nba": NBA,
+    "mlb": MLB,
 }

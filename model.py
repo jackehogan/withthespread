@@ -472,11 +472,16 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     """
     # spread_juice, total, implied_prob excluded until historical odds are backfilled
     # off_rating / def_rating / net_rating populated once nba_api ratings are seeded
-    _RATING_COLS = ["off_rating", "def_rating", "net_rating"]
-    _CTX_ODDS    = ["spread"] + _RATING_COLS
+    # sp_era / sp_whip / sp_k9 populated for MLB once pitcher stats are seeded
+    _RATING_COLS  = ["off_rating", "def_rating", "net_rating"]
+    _PITCHER_COLS = ["sp_era", "sp_whip", "sp_k9"]
+    _CTX_ODDS     = ["spread"] + _RATING_COLS + _PITCHER_COLS
 
     needed = {"team", "season", "period", "date", "home"}
-    _matchup_cols = ["opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge"]
+    _matchup_cols = [
+        "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge",
+        "opp_sp_era", "opp_sp_whip", "sp_era_edge",
+    ]
     _all_out = ["home", "is_b2b"] + _CTX_ODDS + _matchup_cols
 
     if not needed.issubset(games_df.columns):
@@ -502,26 +507,33 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
             df[c] = np.nan
 
     # --- Opponent matchup features ---
-    # Build a lookup: (team, season, period) -> off_rating, def_rating
-    ratings_have = [c for c in ["off_rating", "def_rating"] if c in df.columns]
-    if opp_present and ratings_have:
-        rating_lookup = (
-            df.set_index(["team", "season", "period"])[ratings_have]
-        )
-        # Join opponent ratings by resolving (opponent, season, period)
+    # Build a lookup: (team, season, period) -> off_rating, def_rating, sp_era, sp_whip
+    ratings_have  = [c for c in ["off_rating", "def_rating"] if c in df.columns]
+    pitchers_have = [c for c in ["sp_era", "sp_whip"] if c in df.columns]
+    lookup_cols   = ratings_have + pitchers_have
+
+    if opp_present and lookup_cols:
+        matchup_lookup = df.set_index(["team", "season", "period"])[lookup_cols]
         opp_keys = list(zip(df["opponent"], df["season"], df["period"]))
-        opp_ratings = rating_lookup.reindex(opp_keys)
-        opp_ratings.index = df.index
+        opp_vals = matchup_lookup.reindex(opp_keys)
+        opp_vals.index = df.index
 
         if "off_rating" in ratings_have:
-            df["opp_off_rating"] = opp_ratings["off_rating"].values
+            df["opp_off_rating"] = opp_vals["off_rating"].values
         if "def_rating" in ratings_have:
-            df["opp_def_rating"] = opp_ratings["def_rating"].values
+            df["opp_def_rating"] = opp_vals["def_rating"].values
 
-        # Matchup edges
+        # NBA matchup edges
         if "off_rating" in ratings_have and "def_rating" in ratings_have:
-            df["matchup_off_edge"] = df["off_rating"] - df["opp_def_rating"]   # positive = offence advantage
-            df["matchup_def_edge"] = df["def_rating"] - df["opp_off_rating"]   # negative = defensive advantage
+            df["matchup_off_edge"] = df["off_rating"] - df["opp_def_rating"]
+            df["matchup_def_edge"] = df["def_rating"] - df["opp_off_rating"]
+
+        # MLB pitcher matchup edges (lower ERA = better pitcher, so self - opp)
+        if "sp_era" in pitchers_have:
+            df["opp_sp_era"]  = opp_vals["sp_era"].values
+            df["sp_era_edge"] = df["opp_sp_era"] - df["sp_era"]   # positive = our pitcher is better
+        if "sp_whip" in pitchers_have:
+            df["opp_sp_whip"] = opp_vals["sp_whip"].values
     else:
         for c in _matchup_cols:
             df[c] = np.nan
@@ -652,8 +664,13 @@ def _collect_window(
     df["period"] = target
 
     # --- Context features for the target period ---
-    _CTX_COLS = ["home", "is_b2b", "spread", "off_rating", "def_rating", "net_rating",
-                 "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge"]
+    _CTX_COLS = [
+        "home", "is_b2b", "spread",
+        "off_rating", "def_rating", "net_rating",
+        "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge",
+        "sp_era", "sp_whip", "sp_k9",
+        "opp_sp_era", "opp_sp_whip", "sp_era_edge",
+    ]
     try:
         ctx_slice   = context.xs(target, level="period")
         ctx_aligned = ctx_slice.reindex(common_idx)
@@ -735,8 +752,14 @@ def build_prediction_features(
 
     # Join context features for the upcoming game
     # spread_juice, total, implied_prob re-added once historical odds are backfilled
-    _CTX_COLS = ["home", "is_b2b", "spread", "off_rating", "def_rating", "net_rating",
-                 "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge"]
+    # sp_era / sp_whip / sp_k9 / matchup pitcher cols used for MLB
+    _CTX_COLS = [
+        "home", "is_b2b", "spread",
+        "off_rating", "def_rating", "net_rating",
+        "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge",
+        "sp_era", "sp_whip", "sp_k9",
+        "opp_sp_era", "opp_sp_whip", "sp_era_edge",
+    ]
     if upcoming_context is not None and not upcoming_context.empty:
         for col in _CTX_COLS:
             X[col] = X["team"].map(upcoming_context[col]) if col in upcoming_context.columns else np.nan

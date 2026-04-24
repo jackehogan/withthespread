@@ -532,3 +532,390 @@ def fetch_nba_ratings(season: int, date_to: str | None = None) -> pd.DataFrame:
     # Drop rows with no data (teams with 0 games played in range)
     df = df.dropna(subset=["off_rating", "def_rating"])
     return df
+
+
+# ---------------------------------------------------------------------------
+# MLB — scores via statsapi (free, no key required)
+# ---------------------------------------------------------------------------
+
+# Regular-season game_type codes from statsapi
+_MLB_REGULAR_GAME_TYPES = {"R"}
+
+# Canonical team name corrections across seasons
+# (statsapi uses the current name; historical name -> canonical)
+_MLB_NAME_FIXES: dict[str, str] = {
+    "Cleveland Indians": "Cleveland Guardians",  # renamed after 2021
+}
+
+
+def fetch_season_games_mlb(season: int) -> list[dict]:
+    """
+    Fetch all regular-season MLB game results for a calendar year via statsapi.
+
+    Returns a list of raw statsapi game dicts (only completed regular-season
+    games with scores). Spring training and playoffs are excluded.
+
+    Parameters
+    ----------
+    season : Calendar year (e.g. 2023 for the 2023 MLB season).
+    """
+    try:
+        import statsapi
+    except ImportError:
+        raise ImportError("MLB-StatsAPI not installed. Run: pip install MLB-StatsAPI")
+
+    # Regular season spans late March / early April through late September.
+    start = f"03/15/{season}"
+    end   = f"10/10/{season}"
+
+    raw = statsapi.schedule(start_date=start, end_date=end, sportId=1)
+    return [
+        g for g in raw
+        if g.get("game_type") in _MLB_REGULAR_GAME_TYPES
+        and g.get("status") == "Final"
+        and g.get("away_score") is not None
+        and g.get("home_score") is not None
+    ]
+
+
+def parse_game_results_mlb(
+    raw_games: list[dict],
+    season: int,
+) -> pd.DataFrame:
+    """
+    Convert raw statsapi game dicts to the standard long-format DataFrame.
+
+    One row per team per game with columns:
+        sport, team, opponent, season, period, date,
+        score, opp_score, diff, home,
+        sp_name  (probable starter name, may be empty string)
+
+    period is assigned as sequential game number per team ordered by date,
+    matching the NBA convention (1–162).
+    """
+    from config import SPORTS
+    sport = SPORTS["mlb"]
+
+    records = []
+    for g in raw_games:
+        home  = _MLB_NAME_FIXES.get(g["home_name"], g["home_name"])
+        away  = _MLB_NAME_FIXES.get(g["away_name"], g["away_name"])
+
+        # Skip if either team is not in the known-teams allowlist
+        if sport.known_teams is not None:
+            if home not in sport.known_teams or away not in sport.known_teams:
+                continue
+
+        home_score = int(g["home_score"])
+        away_score = int(g["away_score"])
+        game_date  = g["game_date"][:10]   # YYYY-MM-DD
+
+        home_sp = g.get("home_probable_pitcher") or ""
+        away_sp = g.get("away_probable_pitcher") or ""
+
+        for team, opp, score, opp_sc, is_home, sp_name in (
+            (home, away, home_score, away_score, True,  home_sp),
+            (away, home, away_score, home_score, False, away_sp),
+        ):
+            records.append({
+                "sport":     "mlb",
+                "team":      team,
+                "opponent":  opp,
+                "season":    season,
+                "period":    None,          # assigned below
+                "date":      game_date,
+                "score":     score,
+                "opp_score": opp_sc,
+                "diff":      score - opp_sc,
+                "home":      int(is_home),
+                "sp_name":   sp_name,
+            })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    # Apply regular-season date filter
+    df = filter_regular_season(df, sport, season)
+
+    # Assign sequential game number per team by date
+    df = df.sort_values("date")
+    df["period"] = df.groupby("team").cumcount() + 1
+
+    return df.reset_index(drop=True)
+
+
+def fetch_mlb_pitcher_stats(season: int) -> pd.DataFrame:
+    """
+    Fetch season pitcher stats for all qualified starters via statsapi.
+
+    Uses the official MLB Stats API (free, no key). Returns prior-season stats
+    so they can be joined to upcoming game rows without leakage.
+
+    Parameters
+    ----------
+    season : The season to pull stats from (e.g. pass season-1 to get prior-year
+             stats for a prediction in `season`).
+
+    Returns
+    -------
+    DataFrame indexed by pitcher full name with columns:
+        era, whip, k9, bb9, gs  (games started, for minimum qualifier filter)
+
+    Returns empty DataFrame on failure.
+    """
+    try:
+        import statsapi
+    except ImportError:
+        print("  MLB-StatsAPI not installed.")
+        return pd.DataFrame()
+
+    try:
+        result = statsapi.get("stats", {
+            "stats":       "season",
+            "group":       "pitching",
+            "sportId":     1,
+            "season":      season,
+            "gameType":    "R",
+            "limit":       1000,
+            "playerPool":  "ALL",    # include non-qualified starters
+        })
+    except Exception as exc:
+        print(f"  fetch_mlb_pitcher_stats failed ({exc})")
+        return pd.DataFrame()
+
+    splits = result.get("stats", [{}])[0].get("splits", [])
+    if not splits:
+        return pd.DataFrame()
+
+    rows = []
+    for s in splits:
+        stat = s.get("stat", {})
+        player = s.get("player", {})
+        name = player.get("fullName", "")
+        if not name:
+            continue
+        try:
+            rows.append({
+                "name":  name,
+                "era":   float(stat.get("era", "nan") or "nan"),
+                "whip":  float(stat.get("whip", "nan") or "nan"),
+                "k9":    float(stat.get("strikeoutsPer9Inn", "nan") or "nan"),
+                "bb9":   float(stat.get("walksPer9Inn", "nan") or "nan"),
+                "gs":    int(stat.get("gamesStarted", 0) or 0),
+            })
+        except (ValueError, TypeError):
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).set_index("name")
+    # Keep only pitchers with at least 1 start (filters out pure relievers)
+    df = df[df["gs"] >= 1].drop(columns=["gs"])
+    return df
+
+
+# ---------------------------------------------------------------------------
+# MLB — run lines from SBR CSV / Excel files
+# ---------------------------------------------------------------------------
+# Download historical MLB odds archives from:
+#   https://www.sportsbookreviewsonline.com/scoresoddsarchives/mlb/mlboddsarchives.htm
+#
+# Save files to a local directory (default: data/sbr/).
+# Expected filename pattern: mlb_{season}.xlsx  (e.g. mlb_2023.xlsx)
+# or any Excel/CSV file containing "mlb" and the year in the name.
+#
+# SBR MLB file format (one pair of rows per game: visitor first, then home):
+#   Date | Rot | VH | Team | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | F | Open | Close | ML | 2H
+#
+# VH   : V = visitor (away), H = home
+# F    : final runs scored
+# ML   : moneyline in American odds (e.g. -150 means -150 to win 100)
+# Open : opening run total (over/under); sometimes run line
+# Close: closing run total
+# Run line is always ±1.5 — favorite identified by who has the more negative ML.
+
+def parse_sbr_mlb(filepath: str) -> pd.DataFrame:
+    """
+    Parse a single SBR MLB odds archive file (Excel or CSV).
+
+    Expects the standard SBR format with VH, Team, F (final), and ML columns.
+    Pairs visitor/home rows to reconstruct matchups and assigns run lines
+    (always ±1.5; favorite identified by more negative ML).
+
+    Parameters
+    ----------
+    filepath : Path to the .xlsx or .csv file.
+
+    Returns
+    -------
+    DataFrame with columns:
+        date, team, opponent, home, run_line, moneyline
+    where run_line is -1.5 for the favourite and +1.5 for the underdog.
+    Returns empty DataFrame if the file cannot be parsed.
+    """
+    fp = str(filepath)
+    try:
+        if fp.endswith(".csv"):
+            raw = pd.read_csv(fp, header=0)
+        else:
+            raw = pd.read_excel(fp, header=0)
+    except Exception as exc:
+        print(f"  parse_sbr_mlb: could not read {fp} ({exc})")
+        return pd.DataFrame()
+
+    raw.columns = [str(c).strip().upper() for c in raw.columns]
+
+    # Flexible column name mapping
+    col_map = {}
+    for c in raw.columns:
+        cl = c.upper()
+        if cl in ("VH", "V/H"):
+            col_map["VH"] = c
+        elif cl in ("TEAM",):
+            col_map["TEAM"] = c
+        elif cl in ("F", "FINAL", "SCORE"):
+            col_map["F"] = c
+        elif cl in ("ML", "MONEYLINE", "MONEY LINE"):
+            col_map["ML"] = c
+        elif cl in ("DATE",):
+            col_map["DATE"] = c
+
+    required = ["VH", "TEAM", "F", "ML", "DATE"]
+    missing = [k for k in required if k not in col_map]
+    if missing:
+        print(f"  parse_sbr_mlb: missing columns {missing} in {fp}. "
+              f"Found: {list(raw.columns)}")
+        return pd.DataFrame()
+
+    df = raw[[col_map[k] for k in required]].copy()
+    df.columns = required
+
+    # Parse date: SBR uses YYYYMMDD integers or MM/DD/YYYY strings
+    def _parse_date(val) -> str:
+        s = str(val).strip().replace("/", "-")
+        try:
+            if len(s) == 8 and s.isdigit():
+                return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+            return pd.to_datetime(s).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+
+    df["DATE"] = df["DATE"].apply(_parse_date)
+    df = df[df["DATE"] != ""]
+
+    # Normalise VH
+    df["VH"] = df["VH"].astype(str).str.strip().str.upper()
+    df = df[df["VH"].isin(["V", "H"])]
+
+    # Normalise ML (may contain 'pk', 'PK', or NL for no line)
+    def _parse_ml(val) -> float:
+        try:
+            return float(str(val).replace("pk", "100").replace("PK", "100"))
+        except (ValueError, TypeError):
+            return float("nan")
+
+    df["ML"] = df["ML"].apply(_parse_ml)
+    df["F"]  = pd.to_numeric(df["F"], errors="coerce")
+    df = df.dropna(subset=["F", "ML"])
+
+    # SBR team abbreviations -> full names
+    _SBR_TEAM_MAP = {
+        "ARI": "Arizona Diamondbacks",  "ATL": "Atlanta Braves",
+        "BAL": "Baltimore Orioles",     "BOS": "Boston Red Sox",
+        "CHC": "Chicago Cubs",          "CWS": "Chicago White Sox",
+        "CIN": "Cincinnati Reds",       "CLE": "Cleveland Guardians",
+        "COL": "Colorado Rockies",      "DET": "Detroit Tigers",
+        "HOU": "Houston Astros",        "KC":  "Kansas City Royals",
+        "LAA": "Los Angeles Angels",    "LAD": "Los Angeles Dodgers",
+        "MIA": "Miami Marlins",         "MIL": "Milwaukee Brewers",
+        "MIN": "Minnesota Twins",       "NYM": "New York Mets",
+        "NYY": "New York Yankees",      "OAK": "Oakland Athletics",
+        "PHI": "Philadelphia Phillies", "PIT": "Pittsburgh Pirates",
+        "SD":  "San Diego Padres",      "SF":  "San Francisco Giants",
+        "SEA": "Seattle Mariners",      "STL": "St. Louis Cardinals",
+        "TB":  "Tampa Bay Rays",        "TEX": "Texas Rangers",
+        "TOR": "Toronto Blue Jays",     "WSH": "Washington Nationals",
+        "WAS": "Washington Nationals",
+    }
+    df["TEAM"] = df["TEAM"].astype(str).str.strip().str.upper()
+    df["TEAM"] = df["TEAM"].map(_SBR_TEAM_MAP).fillna(df["TEAM"])
+
+    # Pair rows: each game is visitor (V) row immediately followed by home (H) row
+    records = []
+    rows_list = df.reset_index(drop=True)
+    i = 0
+    while i < len(rows_list) - 1:
+        v_row = rows_list.iloc[i]
+        h_row = rows_list.iloc[i + 1]
+        if v_row["VH"] == "V" and h_row["VH"] == "H" and v_row["DATE"] == h_row["DATE"]:
+            away_team = v_row["TEAM"]
+            home_team = h_row["TEAM"]
+            away_ml   = v_row["ML"]
+            home_ml   = h_row["ML"]
+            date      = v_row["DATE"]
+
+            # Assign run lines: favourite (lower/more negative ML) gets -1.5
+            if pd.isna(away_ml) or pd.isna(home_ml):
+                away_rl, home_rl = float("nan"), float("nan")
+            elif away_ml <= home_ml:
+                away_rl, home_rl = -1.5, +1.5   # away is favourite
+            else:
+                away_rl, home_rl = +1.5, -1.5   # home is favourite
+
+            for team, opp, ml, rl, is_home in (
+                (away_team, home_team, away_ml, away_rl, 0),
+                (home_team, away_team, home_ml, home_rl, 1),
+            ):
+                records.append({
+                    "date":       date,
+                    "team":       team,
+                    "opponent":   opp,
+                    "home":       is_home,
+                    "run_line":   rl,
+                    "moneyline":  ml,
+                })
+            i += 2
+        else:
+            i += 1   # row mismatch — skip one and try to re-sync
+
+    if not records:
+        return pd.DataFrame()
+
+    return pd.DataFrame(records)
+
+
+def load_sbr_mlb(season: int, sbr_dir: str = "data/sbr") -> pd.DataFrame:
+    """
+    Find and parse the SBR CSV/Excel file for a given MLB season.
+
+    Searches `sbr_dir` for files matching `*mlb*{season}*` (case-insensitive).
+    Returns empty DataFrame if no matching file is found.
+
+    Parameters
+    ----------
+    season  : Calendar year (e.g. 2023).
+    sbr_dir : Directory containing downloaded SBR files.
+    """
+    import glob, os
+
+    patterns = [
+        os.path.join(sbr_dir, f"*mlb*{season}*.xlsx"),
+        os.path.join(sbr_dir, f"*mlb*{season}*.xls"),
+        os.path.join(sbr_dir, f"*mlb*{season}*.csv"),
+        os.path.join(sbr_dir, f"*{season}*mlb*.xlsx"),
+        os.path.join(sbr_dir, f"*{season}*mlb*.csv"),
+    ]
+    for pat in patterns:
+        matches = glob.glob(pat, recursive=False)
+        if matches:
+            print(f"  Loading SBR file: {matches[0]}")
+            return parse_sbr_mlb(matches[0])
+
+    print(f"  No SBR file found for MLB {season} in {sbr_dir}/")
+    print(f"  Download from: https://www.sportsbookreviewsonline.com/"
+          f"scoresoddsarchives/mlb/mlboddsarchives.htm")
+    print(f"  Save as: {sbr_dir}/mlb_{season}.xlsx")
+    return pd.DataFrame()
