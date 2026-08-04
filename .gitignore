@@ -22,6 +22,9 @@ logs/
 __pycache__/
 *.pyc
 
+# the trained model IS committed — CI loads it instead of retraining daily
+!data/mlb_model.pkl
+
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

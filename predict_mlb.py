@@ -555,7 +555,7 @@ def _run(
               f"{_required_through.date()} (1d gap). Seeding now...")
         import subprocess, sys as _sys
         subprocess.run(
-            [_sys.executable, "seed_mlb.py", "--season", str(season),
+            [_sys.executable, "seed_mlb.py", "--seasons", str(season),
              "--since", str(_most_recent.date())],
         )
 

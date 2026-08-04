@@ -2,20 +2,32 @@ name: MLB Nightly Predictions
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # 5:00 AM EDT (09:00 UTC)
-  workflow_dispatch:        # manual trigger from GitHub Actions tab
+    # 09:00 UTC = 5:00 AM EDT (4:00 AM EST in winter).
+    # Late West-Coast games are final by then, and statsapi has posted
+    # today's schedule with probable pitchers.
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+# Never let two runs touch the DB at once.
+concurrency:
+  group: mlb-nightly
+  cancel-in-progress: false
 
 jobs:
   predict:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    env:
+      # Runners are UTC. Pin to Eastern so `date` in the shell and
+      # date.today() in Python both resolve to the US baseball day.
+      TZ: America/New_York
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.10
-        uses: actions/setup-python@v5.6.0
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
@@ -23,21 +35,60 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Write config
+      - name: Write config from secret
         env:
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: |
+          if [ -z "$CONFIG_JSON" ]; then
+            echo "::error::Repository secret CONFIG_JSON is not set. Add it under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
           mkdir -p data
-          python -c "import os; open('data/config.txt', 'w').write(os.environ['CONFIG_JSON'])"
+          printf '%s' "$CONFIG_JSON" > data/config.txt
+          if ! python -c "import json; json.load(open('data/config.txt'))"; then
+            echo "::error::CONFIG_JSON is not valid JSON."
+            exit 1
+          fi
+          echo "config written OK"
 
-      - name: Seed recent data
+      - name: Verify MongoDB connectivity
         run: |
-          YEAR=$(date +%Y)
-          YESTERDAY=$(date -d yesterday +%Y-%m-%d)
-          python seed_mlb.py --seasons $YEAR --since $YESTERDAY
+          python - <<'PY'
+          import sys
+          try:
+              import db
+              db.connect().close()
+              print("MongoDB connection OK")
+          except Exception as exc:
+              print("::error::Cannot reach MongoDB Atlas: %s" % exc)
+              print("::error::If this is a timeout, allowlist 0.0.0.0/0 under Atlas -> Network Access. GitHub runners use dynamic IPs.")
+              sys.exit(1)
+          PY
 
-      - name: Train model
-        run: python train_mlb.py --evals 50
+      - name: Seed games since last stored date
+        run: |
+          LAST=$(python - <<'PY'
+          import datetime
+          import pandas as pd
+          import db
+
+          season = datetime.date.today().year
+          client = db.connect()
+          try:
+              games = db.fetch_games(client, "mlb")
+          finally:
+              client.close()
+
+          season_games = games[games["season"] == season] if not games.empty else pd.DataFrame()
+          if season_games.empty or "date" not in season_games.columns:
+              # No rows yet for this season — start from a date safely before Opening Day.
+              print(f"{season}-03-01")
+          else:
+              print(pd.to_datetime(season_games["date"]).max().date())
+          PY
+          )
+          echo "Last seeded date: $LAST"
+          python seed_mlb.py --seasons "$(date +%Y)" --since "$LAST"
 
       - name: Generate predictions
         run: python predict_mlb.py --days-ahead 0

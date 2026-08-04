@@ -1,0 +1,66 @@
+name: MLB Retrain Model
+
+# Manual only. The model trains on seasons <= 2025 with fixed seeds, so a
+# daily rerun would regenerate a byte-identical file. Run this when the
+# training data actually changes — a completed season, or an odds backfill
+# on a historical season — then commit the refreshed pkl.
+on:
+  workflow_dispatch:
+    inputs:
+      evals:
+        description: 'Hyperopt evaluations'
+        required: false
+        default: '50'
+
+concurrency:
+  group: mlb-train
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TZ: America/New_York
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write config from secret
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          if [ -z "$CONFIG_JSON" ]; then
+            echo "::error::Repository secret CONFIG_JSON is not set."
+            exit 1
+          fi
+          mkdir -p data
+          printf '%s' "$CONFIG_JSON" > data/config.txt
+
+      - name: Train model
+        run: python train_mlb.py --evals "${{ inputs.evals }}"
+
+      - name: Commit refreshed model
+        run: |
+          if git diff --quiet -- data/mlb_model.pkl; then
+            echo "Model unchanged — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/mlb_model.pkl
+          git commit -m "Retrain MLB model (via workflow_dispatch)"
+          git push
