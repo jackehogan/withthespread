@@ -32,6 +32,7 @@ import http.client
 import json
 import re
 import time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -39,6 +40,36 @@ import requests
 from config import SportConfig
 
 _ODDS_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+# All game dates in the DB are keyed to US/Eastern — see _et_date.
+_ET = ZoneInfo("America/New_York")
+
+
+def _et_date(ts: str) -> str:
+    """
+    Convert a UTC timestamp to its US/Eastern calendar date ('YYYY-MM-DD').
+
+    MLB's official game date is the local date at the ballpark, and statsapi
+    reports it that way.  Every odds feed (ESPN, the-odds-api, ProphetX)
+    timestamps in UTC instead, so any first pitch from 8pm ET onward lands on
+    the *next* UTC day.  Slicing the raw string files those games under
+    tomorrow, and the (team, date) merge against scores silently misses — which
+    cost ~43% of West-Coast home games their run line before this was fixed.
+
+    Eastern is a safe stand-in for ballpark-local time: the latest MLB first
+    pitch is ~7pm PT (10pm ET), so the ET date always equals the official date.
+
+    Falls back to the leading 10 characters if the timestamp cannot be parsed.
+    """
+    if not ts:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ts[:10]
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(_ET).strftime("%Y-%m-%d")
 
 # Stage strings that mean a game is NOT regular season for each sport.
 # Anything not in this set (including null/empty) is treated as regular season.
@@ -410,8 +441,7 @@ def fetch_historical_spreads(
     game_date_set = set(game_dates)
     data = [
         g for g in data
-        if datetime.datetime.strptime(g["commence_time"], _ODDS_FMT).strftime("%Y-%m-%d")
-        in game_date_set
+        if _et_date(g["commence_time"]) in game_date_set
     ]
     return _parse_spreads(data)
 
@@ -460,14 +490,15 @@ def fetch_upcoming_spreads(
         data = [
             g for g in data
             if min_date
-            <= datetime.datetime.strptime(g["commence_time"], _ODDS_FMT).date()
+            <= datetime.date.fromisoformat(_et_date(g["commence_time"]))
             <= max_date
         ]
     else:
-        cutoff = datetime.datetime.utcnow() + datetime.timedelta(days=7)
+        cutoff = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7)
         data = [
             g for g in data
-            if datetime.datetime.strptime(g["commence_time"], _ODDS_FMT) < cutoff
+            if datetime.datetime.strptime(g["commence_time"], _ODDS_FMT)
+            .replace(tzinfo=datetime.timezone.utc) < cutoff
         ]
 
     return _parse_spreads(data)
@@ -507,7 +538,7 @@ def _parse_spreads(spreaddata: list[dict]) -> pd.DataFrame:
 
     for i, game in enumerate(spreaddata):
         home_team = game.get("home_team", "")
-        game_date = game.get("commence_time", "")[:10]
+        game_date = _et_date(game.get("commence_time", ""))
         bookmakers = game.get("bookmakers", [])
         if not bookmakers:
             continue
@@ -662,11 +693,22 @@ _ESPN_HDRS  = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 # ESPN team displayName -> canonical name (edge cases only; most match statsapi)
 _ESPN_TEAM_FIX: dict[str, str] = {
     "Cleveland Indians": "Cleveland Guardians",   # renamed 2022
-    "Athletics": "Oakland Athletics",
 }
 
+# The franchise dropped "Oakland" after the 2024 season.  statsapi — which is
+# what the DB `team` field is keyed on — reports "Oakland Athletics" through
+# 2024 and plain "Athletics" from 2025, while ESPN says "Athletics" in both
+# eras.  Mapping unconditionally to "Oakland Athletics" was correct until 2024
+# and silently broke every A's merge from 2025 on (0% run-line fill).
+_ATHLETICS_RENAMED_FROM = 2025
 
-def _espn_canonical(name: str) -> str:
+
+def _espn_canonical(name: str, season: int | None = None) -> str:
+    """Map an ESPN display name onto the statsapi spelling for that season."""
+    if name == "Athletics":
+        if season is not None and season < _ATHLETICS_RENAMED_FROM:
+            return "Oakland Athletics"
+        return "Athletics"
     return _ESPN_TEAM_FIX.get(name, name)
 
 
@@ -784,12 +826,15 @@ def fetch_espn_game_odds(event_id: str, retries: int = 3) -> dict | None:
     # --- Game metadata from header ---
     header = data.get("header", {})
     comp   = header.get("competitions", [{}])[0]
-    game_date = (comp.get("date") or "")[:10]
+    game_date = _et_date(comp.get("date") or "")
+
+    # Season drives the Athletics naming era — see _espn_canonical.
+    _season = int(game_date[:4]) if game_date else None
 
     home_team = away_team = None
     home_score = away_score = None
     for c in comp.get("competitors", []):
-        name = _espn_canonical(c.get("team", {}).get("displayName", ""))
+        name = _espn_canonical(c.get("team", {}).get("displayName", ""), _season)
         score_str = c.get("score")
         score = int(score_str) if score_str and str(score_str).isdigit() else None
         if c.get("homeAway") == "home":

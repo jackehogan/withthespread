@@ -10,16 +10,28 @@ Setup
 Add a "prophetx" block to data/config.txt:
     {
       "prophetx": {
-        "access_key":     "your_access_key",
-        "secret_key":     "your_secret_key",
-        "bankroll":       1000.0,
-        "kelly_fraction": 0.10,
-        "sandbox":        false,
-        "enabled":        true,
-        "min_ev":         0.05,
-        "max_stake":      50.0
+        "access_key":      "your_access_key",
+        "secret_key":      "your_secret_key",
+        "bankroll":        1000.0,
+        "kelly_fraction":  0.10,
+        "sandbox":         true,
+        "dry_run":         true,
+        "enabled":         true,
+        "min_ev":          0.05,
+        "max_stake":       50.0,
+        "max_total_stake": 250.0
       }
     }
+
+Safety flags — both default to the safe value when absent or malformed, so
+reaching real money takes two deliberate edits:
+    sandbox : true  -> hit the sandbox host; false -> production host.
+    dry_run : true  -> log what would be wagered and place nothing.
+
+Bets are priced against ProphetX's own book, not the sportsbook odds the
+model quoted.  A pick that clears min_ev at the model's reference price can
+easily be -EV at the exchange price, so EV is recomputed from `coverprob`
+and the live `px_odds` before any stake is sized.
 
 Request API access at: https://docs.prophetx.co/docs/getting-started
 """
@@ -35,7 +47,23 @@ import numpy as np
 import pandas as pd
 import requests
 
+# Single source of truth for UTC -> US/Eastern date conversion.  ProphetX
+# timestamps events in UTC like every other feed, so the same rollover bug
+# applies here (see data_pipeline._et_date).
+from data_pipeline import _et_date
+
 logger = logging.getLogger(__name__)
+
+
+def _american_ev(prob: float, odds: float) -> float:
+    """EV per $1 staked at the given win probability and American odds."""
+    try:
+        if np.isnan(prob) or np.isnan(odds):
+            return float("nan")
+        payout = 100.0 / abs(odds) if odds < 0 else odds / 100.0
+        return prob * payout - (1.0 - prob)
+    except (TypeError, ValueError):
+        return float("nan")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -102,16 +130,26 @@ class ProphetXClient:
         secret_key: str,
         bankroll: float = 1000.0,
         kelly_fraction: float = 0.10,
-        sandbox: bool = False,
+        sandbox: bool = True,
         min_ev: float = 0.05,
         max_stake: float = 50.0,
+        max_total_stake: float | None = None,
+        dry_run: bool = True,
     ) -> None:
+        # sandbox and dry_run both default to the safe value: reaching real
+        # money requires opting in twice, explicitly, in config.
         self.access_key     = access_key
         self.secret_key     = secret_key
         self.bankroll       = bankroll
         self.kelly_fraction = kelly_fraction
         self.min_ev         = min_ev
         self.max_stake      = max_stake
+        # Ceiling on combined stake across a single slate.  Without this,
+        # max_stake only bounds one bet and N qualifying bets risk N x max_stake.
+        self.max_total_stake = (
+            max_total_stake if max_total_stake is not None else max_stake * 5.0
+        )
+        self.dry_run        = dry_run
         self.base_url       = _SANDBOX_BASE if sandbox else _PROD_BASE
         self.sandbox        = sandbox
 
@@ -133,14 +171,19 @@ class ProphetXClient:
         px = cfg.get("prophetx", {})
         if not px:
             raise KeyError("No 'prophetx' block found in config.txt.")
+        max_total = px.get("max_total_stake")
         return cls(
-            access_key     = px["access_key"],
-            secret_key     = px["secret_key"],
-            bankroll       = float(px.get("bankroll",       1000.0)),
-            kelly_fraction = float(px.get("kelly_fraction", 0.10)),
-            sandbox        = bool(px.get("sandbox",         False)),
-            min_ev         = float(px.get("min_ev",         0.05)),
-            max_stake      = float(px.get("max_stake",      50.0)),
+            access_key      = px["access_key"],
+            secret_key      = px["secret_key"],
+            bankroll        = float(px.get("bankroll",       1000.0)),
+            kelly_fraction  = float(px.get("kelly_fraction", 0.10)),
+            # Absent or malformed config must not silently reach production
+            # or place live wagers — both flags must be set to False on purpose.
+            sandbox         = bool(px.get("sandbox",  True)),
+            dry_run         = bool(px.get("dry_run",  True)),
+            min_ev          = float(px.get("min_ev",         0.05)),
+            max_stake       = float(px.get("max_stake",      50.0)),
+            max_total_stake = float(max_total) if max_total is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -230,10 +273,13 @@ class ProphetXClient:
             params={"tournament_id": tournament_id},
         )
         events = data.get("data", [])
-        # Filter by date — event start times are ISO strings
+        # start_time is a UTC ISO string, so a raw prefix match drops every
+        # first pitch from 8pm ET onward into the next day and silently loses
+        # most of the West-Coast slate.  Compare on the Eastern date instead,
+        # which is what the DB and the model's target_date are keyed on.
         day_events = [
             e for e in events
-            if e.get("start_time", "").startswith(target_date)
+            if _et_date(e.get("start_time", "")) == target_date
         ]
         return day_events
 
@@ -379,88 +425,141 @@ class ProphetXClient:
         Parameters
         ----------
         preds       : DataFrame from predict_mlb._run() — indexed by team name,
-                      must have columns: ev, bet, moneyline, ml_odds, coverprob.
+                      must have columns: ev, bet, coverprob.
         markets     : Dict from get_mlb_run_lines() — team → {line_id, px_odds}.
         target_date : 'YYYY-MM-DD' — used as part of the idempotency key.
 
         Returns
         -------
-        DataFrame with one row per attempted bet and columns:
-            team, bet, ev, stake, line_id, requested_odds, snapped_odds,
-            status, wager_id, error
+        DataFrame with one row per considered selection and columns:
+            team, bet, model_ev, ev, coverprob, stake, line_id,
+            requested_odds, snapped_odds, status, wager_id, error
+
+        `model_ev` is EV at the sportsbook price the model quoted; `ev` is EV
+        at ProphetX's live price and is what gates the bet.  status is one of
+        PLACED, DRY_RUN, NO_MARKET, BELOW_MIN_EV, ZERO_STAKE,
+        TOTAL_CAP_REACHED, INSUFFICIENT_FUNDS, ERROR.
         """
         results = []
 
-        # Filter to positive-EV bets above threshold
-        ev_bets = preds[preds["ev"] >= self.min_ev].copy()
-        if ev_bets.empty:
-            logger.info("ProphetX: no bets meet min_ev=%.3f threshold.", self.min_ev)
-            return pd.DataFrame()
+        # Only teams the exchange actually has a market for are actionable.
+        candidates = preds[preds.index.isin(markets.keys())].copy()
+        skipped = preds[~preds.index.isin(markets.keys())]
+        for team, row in skipped.iterrows():
+            results.append({
+                "team": team, "bet": row.get("bet", "SPREAD"),
+                "model_ev": float(row.get("ev", float("nan"))),
+                "ev": float("nan"), "coverprob": float(row.get("coverprob", float("nan"))),
+                "stake": 0.0, "line_id": None,
+                "requested_odds": None, "snapped_odds": None,
+                "status": "NO_MARKET", "wager_id": None,
+                "error": "Team not found in ProphetX markets",
+            })
+
+        if candidates.empty:
+            logger.info("ProphetX: no predicted teams have a market on the exchange.")
+            return pd.DataFrame(results)
 
         balance = self.get_balance()
-        logger.info("ProphetX: account balance = $%.2f", balance)
+        logger.info(
+            "ProphetX: balance=$%.2f  sandbox=%s  dry_run=%s",
+            balance, self.sandbox, self.dry_run,
+        )
 
-        for team, row in ev_bets.iterrows():
+        committed = 0.0   # running total staked this slate
+
+        for team, row in candidates.iterrows():
             bet_market = row.get("bet", "SPREAD")
-            ev         = float(row.get("ev",  float("nan")))
-            juice      = float(row.get("ml_odds", float("nan"))) if bet_market == "ML" \
-                         else float(row.get("moneyline", float("nan")))
+            model_ev   = float(row.get("ev", float("nan")))
+            coverprob  = float(row.get("coverprob", float("nan")))
 
-            if team not in markets:
+            market   = markets[team]
+            line_id  = market["line_id"]
+            px_odds  = float(market["px_odds"])
+
+            # Re-price against the exchange's own book.  `preds["ev"]` was
+            # computed against a different sportsbook's number, so it says
+            # nothing about whether this wager is +EV at ProphetX's price.
+            px_ev = _american_ev(coverprob, px_odds)
+
+            base = {
+                "team": team, "bet": bet_market,
+                "model_ev": model_ev, "ev": px_ev, "coverprob": coverprob,
+                "line_id": line_id, "requested_odds": px_odds,
+            }
+
+            if np.isnan(px_ev) or px_ev < self.min_ev:
                 results.append({
-                    "team": team, "bet": bet_market, "ev": ev,
-                    "stake": 0.0, "line_id": None,
-                    "requested_odds": juice, "snapped_odds": None,
-                    "status": "NO_MARKET", "wager_id": None,
-                    "error": "Team not found in ProphetX markets",
+                    **base, "stake": 0.0, "snapped_odds": None,
+                    "status": "BELOW_MIN_EV", "wager_id": None,
+                    "error": f"EV {px_ev:+.3f} at ProphetX price {px_odds:+.0f} "
+                             f"< min_ev {self.min_ev:.3f}",
                 })
                 continue
 
-            market    = markets[team]
-            line_id   = market["line_id"]
-            stake     = self._kelly_stake(ev, juice)
+            stake = self._kelly_stake(px_ev, px_odds)
 
             if stake <= 0:
                 results.append({
-                    "team": team, "bet": bet_market, "ev": ev,
-                    "stake": 0.0, "line_id": line_id,
-                    "requested_odds": juice, "snapped_odds": None,
+                    **base, "stake": 0.0, "snapped_odds": None,
                     "status": "ZERO_STAKE", "wager_id": None,
                     "error": "Kelly stake computed to zero",
                 })
                 continue
 
+            if committed + stake > self.max_total_stake:
+                results.append({
+                    **base, "stake": stake, "snapped_odds": None,
+                    "status": "TOTAL_CAP_REACHED", "wager_id": None,
+                    "error": f"Would commit ${committed + stake:.2f} > "
+                             f"max_total_stake ${self.max_total_stake:.2f}",
+                })
+                continue
+
             if stake > balance:
                 results.append({
-                    "team": team, "bet": bet_market, "ev": ev,
-                    "stake": stake, "line_id": line_id,
-                    "requested_odds": juice, "snapped_odds": None,
+                    **base, "stake": stake, "snapped_odds": None,
                     "status": "INSUFFICIENT_FUNDS", "wager_id": None,
                     "error": f"Stake ${stake:.2f} > balance ${balance:.2f}",
                 })
                 continue
 
-            # Snap odds to valid ProphetX ladder
-            snapped = self.snap_to_ladder(juice)
+            # px_odds came off the exchange so it should already be on the
+            # ladder; snapping is defensive against a stale or derived price.
+            snapped = self.snap_to_ladder(px_odds)
 
-            # Idempotency key: deterministic per team+date so re-runs don't double-bet
-            ext_id = f"wts-{target_date}-{team.lower().replace(' ', '-')}"
-
-            try:
-                resp    = self.place_wager(line_id, snapped, stake, external_id=ext_id)
-                wager   = resp.get("data", {}).get("wager", resp.get("data", {}))
-                wager_id = wager.get("id") or wager.get("wager_id")
-                balance -= stake   # deduct from local balance tracker
+            if self.dry_run:
                 results.append({
-                    "team": team, "bet": bet_market, "ev": ev,
-                    "stake": stake, "line_id": line_id,
-                    "requested_odds": juice, "snapped_odds": snapped,
-                    "status": "PLACED", "wager_id": wager_id,
+                    **base, "stake": stake, "snapped_odds": snapped,
+                    "status": "DRY_RUN", "wager_id": None,
                     "error": None,
                 })
+                committed += stake
+                balance   -= stake
                 logger.info(
-                    "ProphetX: PLACED  %s %s  odds=%d  stake=$%.2f  wager_id=%s",
-                    team, bet_market, snapped, stake, wager_id,
+                    "ProphetX: DRY_RUN %s %s  odds=%d  stake=$%.2f  ev=%+.3f",
+                    team, bet_market, snapped, stake, px_ev,
+                )
+                continue
+
+            # Idempotency key: deterministic per team+date+market so re-runs
+            # cannot double-bet the same selection.
+            ext_id = (f"wts-{target_date}-{bet_market.lower()}-"
+                      f"{team.lower().replace(' ', '-')}")
+
+            try:
+                resp     = self.place_wager(line_id, snapped, stake, external_id=ext_id)
+                wager    = resp.get("data", {}).get("wager", resp.get("data", {}))
+                wager_id = wager.get("id") or wager.get("wager_id")
+                committed += stake
+                balance   -= stake
+                results.append({
+                    **base, "stake": stake, "snapped_odds": snapped,
+                    "status": "PLACED", "wager_id": wager_id, "error": None,
+                })
+                logger.info(
+                    "ProphetX: PLACED  %s %s  odds=%d  stake=$%.2f  ev=%+.3f  wager_id=%s",
+                    team, bet_market, snapped, stake, px_ev, wager_id,
                 )
             except requests.HTTPError as exc:
                 err = str(exc)
@@ -469,11 +568,8 @@ class ProphetXClient:
                 except Exception:
                     pass
                 results.append({
-                    "team": team, "bet": bet_market, "ev": ev,
-                    "stake": stake, "line_id": line_id,
-                    "requested_odds": juice, "snapped_odds": snapped,
-                    "status": "ERROR", "wager_id": None,
-                    "error": err,
+                    **base, "stake": stake, "snapped_odds": snapped,
+                    "status": "ERROR", "wager_id": None, "error": err,
                 })
                 logger.error("ProphetX: FAILED  %s  — %s", team, err)
 

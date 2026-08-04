@@ -923,16 +923,21 @@ def _run(
             print(f"  [ProphetX] {len(markets)} team markets found.")
             bet_results = px.place_model_bets(preds, markets, target_date)
             if not bet_results.empty:
-                placed = bet_results[bet_results["status"] == "PLACED"]
-                skipped = bet_results[bet_results["status"] != "PLACED"]
-                if not placed.empty:
-                    print(f"  [ProphetX] {len(placed)} bet(s) placed:")
-                    for _, r in placed.iterrows():
+                mode    = "DRY_RUN" if px.dry_run else "PLACED"
+                actioned = bet_results[bet_results["status"] == mode]
+                skipped  = bet_results[bet_results["status"] != mode]
+                if not actioned.empty:
+                    label = "would place" if px.dry_run else "placed"
+                    env   = "sandbox" if px.sandbox else "PRODUCTION"
+                    print(f"  [ProphetX/{env}] {len(actioned)} bet(s) {label} "
+                          f"(${actioned['stake'].sum():.2f} total):")
+                    for _, r in actioned.iterrows():
                         print(f"    {r['team']:<28} {r['bet']:<6}  "
-                              f"odds={r['snapped_odds']:+d}  stake=${r['stake']:.2f}  "
-                              f"EV={r['ev']:+.3f}  id={r['wager_id']}")
+                              f"odds={int(r['snapped_odds']):+d}  stake=${r['stake']:.2f}  "
+                              f"EV={r['ev']:+.3f} (model {r['model_ev']:+.3f})  "
+                              f"id={r['wager_id']}")
                 if not skipped.empty:
-                    print(f"  [ProphetX] {len(skipped)} bet(s) skipped:")
+                    print(f"  [ProphetX] {len(skipped)} selection(s) not actioned:")
                     for _, r in skipped.iterrows():
                         print(f"    {r['team']:<28} {r['status']}: {r['error']}")
             else:
