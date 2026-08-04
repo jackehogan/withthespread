@@ -71,21 +71,37 @@ def seed_mlb_season(
         print("  No completed games returned.")
         return
 
-    # Period offsets are only needed for incremental (--since) runs where only
-    # NEW games are fetched. For a full-season reseed all games are fetched and
-    # cumcount already assigns correct 1-based periods — adding the existing max
-    # on top shifts them into new slots and creates duplicates.
+    # Incremental (--since) runs always overlap games that are already seeded,
+    # because the since-date is the last date in the DB. Pass the existing
+    # (team, game_pk) -> period map so those games keep their stored period
+    # instead of being re-numbered into duplicate rows; period_offsets then
+    # only sets where genuinely new games start. A full-season reseed needs
+    # neither — cumcount already numbers every game correctly from 1.
     period_offsets: dict[str, int] = {}
+    known_periods: dict[tuple[str, str], int] = {}
     if since:
         _offset_client = db.connect()
         try:
-            _existing_periods = db.fetch_games(_offset_client, "mlb", season)
+            _existing = db.fetch_games(_offset_client, "mlb", season)
         finally:
             _offset_client.close()
-        if not _existing_periods.empty and "period" in _existing_periods.columns:
-            period_offsets = _existing_periods.groupby("team")["period"].max().to_dict()
+        if not _existing.empty and "period" in _existing.columns:
+            period_offsets = _existing.groupby("team")["period"].max().to_dict()
+            if "game_pk" in _existing.columns:
+                _pk_rows = _existing[
+                    _existing["game_pk"].notna()
+                    & (_existing["game_pk"].astype(str) != "")
+                ]
+                known_periods = {
+                    (t, str(pk)): int(p)
+                    for t, pk, p in zip(
+                        _pk_rows["team"], _pk_rows["game_pk"], _pk_rows["period"]
+                    )
+                }
 
-    game_df = dp.parse_game_results_mlb(raw, season, period_offsets=period_offsets)
+    game_df = dp.parse_game_results_mlb(
+        raw, season, period_offsets=period_offsets, known_periods=known_periods
+    )
     if game_df.empty:
         print("  No valid games after filtering.")
         return

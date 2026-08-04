@@ -1215,6 +1215,7 @@ def parse_game_results_mlb(
     raw_games: list[dict],
     season: int,
     period_offsets: dict[str, int] | None = None,
+    known_periods: dict[tuple[str, str], int] | None = None,
 ) -> pd.DataFrame:
     """
     Convert raw statsapi game dicts to the standard long-format DataFrame.
@@ -1230,8 +1231,13 @@ def parse_game_results_mlb(
     Parameters
     ----------
     period_offsets : optional dict mapping team name -> current max period in DB.
-        When provided, new periods continue from that offset instead of starting
-        at 1. Required for correct period assignment on incremental seeds.
+        Sets the starting point for games not already in `known_periods`.
+    known_periods : optional dict mapping (team, game_pk) -> period already
+        stored in the DB.  Pass this on every incremental (--since) seed: it
+        makes period assignment idempotent, so re-fetching a game that is
+        already seeded reuses its period instead of minting a duplicate row
+        under a new one.  Omit for a full-season reseed, which numbers every
+        game from 1.
     """
     from config import SPORTS
     sport = SPORTS["mlb"]
@@ -1282,15 +1288,33 @@ def parse_game_results_mlb(
     # Apply regular-season date filter
     df = filter_regular_season(df, sport, season)
 
-    # Assign sequential game number per team by date.
-    # If period_offsets provided, continue from each team's existing max period
-    # so incremental seeds don't restart at 1.
     df = df.sort_values("date")
-    df["period"] = df.groupby("team").cumcount() + 1
-    if period_offsets:
-        df["period"] = df.apply(
-            lambda r: r["period"] + period_offsets.get(r["team"], 0), axis=1
-        )
+
+    if known_periods:
+        # Identity-keyed assignment.  A --since run always re-fetches games
+        # that are already seeded (the since-date itself overlaps), and giving
+        # those a fresh cumcount+offset filed the same game_pk under a second
+        # period — 926 duplicate rows accumulated this way before it was
+        # caught.  Reuse the stored period for any game already known and only
+        # allocate new numbers for genuinely new games.
+        next_by_team = dict(period_offsets or {})
+        periods = []
+        for team, pk in zip(df["team"], df["game_pk"]):
+            existing = known_periods.get((team, str(pk)))
+            if existing is not None:
+                periods.append(int(existing))
+            else:
+                nxt = int(next_by_team.get(team, 0)) + 1
+                next_by_team[team] = nxt
+                periods.append(nxt)
+        df["period"] = periods
+    else:
+        # Full-season seed: number every game from 1 in date order.
+        df["period"] = df.groupby("team").cumcount() + 1
+        if period_offsets:
+            df["period"] = df["period"] + (
+                df["team"].map(period_offsets).fillna(0).astype(int)
+            )
 
     return df.reset_index(drop=True)
 
