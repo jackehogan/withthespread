@@ -30,6 +30,7 @@ fetch_upcoming_spreads(sport, dates, key_type) -> pd.DataFrame
 import datetime
 import http.client
 import json
+import re
 import time
 
 import pandas as pd
@@ -45,6 +46,102 @@ _NON_REGULAR_STAGES = {
     "nfl": {"Pre Season", "Post Season", "Pro Bowl"},
     "nba": {"NBA Playoffs", "Play-In Tournament", "All-Star"},
 }
+
+
+def _normalize_pitcher_name(name: str) -> str:
+    """
+    Normalize a pitcher name for reliable lookup across data sources.
+
+    statsapi schedule returns accented characters (e.g. "Eury Pérez") but the
+    encoding is sometimes mangled in transit.  Stripping all diacritics to ASCII
+    equivalents and lowercasing ensures the schedule name matches the stats name
+    regardless of source encoding.
+    """
+    import unicodedata
+    if not name:
+        return ""
+    # Decompose to base + combining chars, then drop the combining chars
+    nfkd = unicodedata.normalize("NFKD", str(name))
+    ascii_name = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return ascii_name.strip().lower()
+
+
+def data_quality_report(games_df: pd.DataFrame, label: str = "") -> dict:
+    """
+    Report fill rates for all seeded columns and flag anything below threshold.
+
+    Returns a dict of {col: fill_rate} for programmatic use.
+    Prints a formatted report with warnings for low-fill columns.
+
+    Thresholds
+    ----------
+    < 0.60  ERROR  — feature is essentially absent, model quality severely impacted
+    < 0.80  WARN   — significant data gap, check seeding pipeline
+    >= 0.80 OK
+    """
+    ERROR_THRESH = 0.60
+    WARN_THRESH  = 0.80
+
+    SEED_COLS = [
+        ("spreadscore",    "Training target — games without this are dropped"),
+        ("moneyline",      "Run-line juice — needed for EV computation"),
+        ("sp_era",         "Starter ERA — prior season"),
+        ("sp_whip",        "Starter WHIP — prior season"),
+        ("bp_era",         "Bullpen ERA — prior season"),
+        ("bp_ip_game",     "Bullpen IP per game — needed for bp_ip_14d fatigue feature"),
+    ]
+
+    title = f"Data Quality Report{' — ' + label if label else ''}"
+    print(f"\n{'=' * 60}")
+    print(title)
+    print(f"{'=' * 60}")
+    print(f"  Total rows: {len(games_df)}")
+
+    rates = {}
+    errors = []
+    warns  = []
+
+    for col, desc in SEED_COLS:
+        if col not in games_df.columns:
+            print(f"  {'NOT IN DB':6s}  {col:22s}  {desc}")
+            rates[col] = 0.0
+            errors.append(col)
+            continue
+        n    = int(games_df[col].notna().sum())
+        rate = n / max(len(games_df), 1)
+        rates[col] = rate
+        if rate < ERROR_THRESH:
+            tag = "ERROR"
+            errors.append(col)
+        elif rate < WARN_THRESH:
+            tag = "WARN "
+            warns.append(col)
+        else:
+            tag = "OK   "
+        print(f"  {tag}  {col:22s}: {n:5d}/{len(games_df):5d} ({rate:5.1%})  {desc}")
+
+    # sp_era name-mismatch breakdown
+    if "sp_era" in games_df.columns and "sp_name" in games_df.columns:
+        missing_era = games_df[games_df["sp_era"].isna()]
+        has_name    = missing_era["sp_name"].notna() & (missing_era["sp_name"] != "")
+        if has_name.sum() > 0:
+            print(f"\n  sp_era name-mismatch detail ({has_name.sum()} rows have sp_name but no ERA match):")
+            top = missing_era[has_name]["sp_name"].value_counts().head(5)
+            for name, cnt in top.items():
+                print(f"    {cnt:4d}x  {name}")
+            if len(top) == 5:
+                print(f"    ... (run --pitcher-refresh to attempt a fix)")
+
+    if errors:
+        print(f"\n  ERRORS ({len(errors)} columns below {ERROR_THRESH:.0%}): {errors}")
+        print("  These features will be mostly NaN in the model — check seeding.")
+    if warns:
+        print(f"  WARNS  ({len(warns)} columns below {WARN_THRESH:.0%}): {warns}")
+    if not errors and not warns:
+        print(f"\n  All columns OK.")
+
+    print(f"{'=' * 60}\n")
+    return rates
 
 
 def _read_config(path: str = "data/config.txt") -> dict:
@@ -415,14 +512,21 @@ def _parse_spreads(spreaddata: list[dict]) -> pd.DataFrame:
         if not bookmakers:
             continue
 
-        # Use the first bookmaker that has the most markets
-        bm = max(bookmakers, key=lambda b: len(b["markets"]))
+        # Prefer major US books in order; fall back to most-markets
+        _PREFERRED_BOOKS = ["fanduel", "draftkings", "betmgm", "caesars", "pointsbet"]
+        bm_by_key = {b["key"]: b for b in bookmakers}
+        bm = next(
+            (bm_by_key[k] for k in _PREFERRED_BOOKS if k in bm_by_key),
+            max(bookmakers, key=lambda b: len(b["markets"])),
+        )
         markets_by_key = {m["key"]: m for m in bm["markets"]}
 
         # --- spreads ---
         if "spreads" in markets_by_key:
             for outcome in markets_by_key["spreads"]["outcomes"]:
                 t = outcome["name"]
+                if t in spreads:
+                    continue  # keep first occurrence — avoids doubleheader overwrite
                 spreads[t]      = outcome["point"]
                 spread_juice[t] = outcome.get("price", None)
                 opponents[t]    = ""   # filled below
@@ -535,6 +639,468 @@ def fetch_nba_ratings(season: int, date_to: str | None = None) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# MLB — run lines / moneylines via ESPN API (free, no key required)
+# ---------------------------------------------------------------------------
+# ESPN's internal API returns pickcenter odds for completed games going back
+# to at least 2022.  No authentication or key is required.
+#
+# Endpoints used:
+#   GET sports.core.api.espn.com/v2/sports/baseball/leagues/mlb/seasons/{year}
+#       /types/2/events?limit=900&page={n}
+#     -> returns event IDs for the full regular season
+#
+#   GET site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary?event={id}
+#     -> returns pickcenter[0]: spread, moneyLine per team, overUnder, etc.
+#
+# Run lines in MLB are always ±1.5 — the favourite gets -1.5 (must win by 2+).
+# We identify the favourite from the team whose moneyLine is more negative.
+
+_ESPN_CORE  = "https://sports.core.api.espn.com/v2/sports/baseball/leagues/mlb"
+_ESPN_SITE  = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb"
+_ESPN_HDRS  = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+# ESPN team displayName -> canonical name (edge cases only; most match statsapi)
+_ESPN_TEAM_FIX: dict[str, str] = {
+    "Cleveland Indians": "Cleveland Guardians",   # renamed 2022
+    "Athletics": "Oakland Athletics",
+}
+
+
+def _espn_canonical(name: str) -> str:
+    return _ESPN_TEAM_FIX.get(name, name)
+
+
+def fetch_espn_event_ids_for_date(date: str) -> list[str]:
+    """
+    Return ESPN event IDs for a specific date using the scoreboard endpoint.
+
+    Much faster than fetching the full season list — use for nightly incremental
+    updates where only 1-2 dates are needed.
+
+    Parameters
+    ----------
+    date : 'YYYY-MM-DD' string.
+
+    Returns
+    -------
+    List of event ID strings for that date.
+    """
+    date_compact = date.replace("-", "")
+    url = (f"https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard"
+           f"?dates={date_compact}&limit=50")
+    try:
+        r = requests.get(url, headers=_ESPN_HDRS, timeout=15)
+        r.raise_for_status()
+    except Exception as exc:
+        print(f"  fetch_espn_event_ids_for_date {date} failed: {exc}")
+        return []
+
+    data = r.json()
+    ids = []
+    for event in data.get("events", []):
+        eid = event.get("id")
+        if eid:
+            ids.append(str(eid))
+    return ids
+
+
+def fetch_espn_event_ids(season: int) -> list[str]:
+    """
+    Return all regular-season event IDs for a given MLB season from ESPN.
+
+    Parameters
+    ----------
+    season : Calendar year (e.g. 2023).
+
+    Returns
+    -------
+    List of event ID strings (e.g. ['401471020', ...]).
+    """
+    ids: list[str] = []
+    page = 1
+    while True:
+        url = (f"{_ESPN_CORE}/seasons/{season}/types/2/events"
+               f"?limit=900&page={page}&lang=en&region=us")
+        try:
+            r = requests.get(url, headers=_ESPN_HDRS, timeout=15)
+            r.raise_for_status()
+        except Exception as exc:
+            print(f"  fetch_espn_event_ids page {page} failed: {exc}")
+            break
+
+        data = r.json()
+        items = data.get("items", [])
+        for item in items:
+            ref = item.get("$ref", "")
+            m = re.search(r"/events/(\d+)", ref)
+            if m:
+                ids.append(m.group(1))
+
+        if page >= data.get("pageCount", 1):
+            break
+        page += 1
+
+    return ids
+
+
+def fetch_espn_game_odds(event_id: str, retries: int = 3) -> dict | None:
+    """
+    Fetch run line, moneyline, and over/under for one MLB game from ESPN.
+
+    Returns a dict with keys:
+        game_date    YYYY-MM-DD
+        home_team    canonical team name
+        away_team    canonical team name
+        home_score   int | None
+        away_score   int | None
+        run_line_home  float  (-1.5 for home favourite, +1.5 for underdog)
+        run_line_away  float
+        ml_home      float  (moneyline American odds)
+        ml_away      float
+        over_under   float | None
+
+    Returns None if no pickcenter data is available.
+    Retries with exponential backoff on transient failures (rate limiting etc).
+    """
+    url = f"{_ESPN_SITE}/summary?event={event_id}"
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers=_ESPN_HDRS, timeout=8)
+            if r.status_code == 429:
+                wait = 10 * (2 ** attempt)   # 10s, 20s, 40s
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+            else:
+                return None
+    else:
+        return None
+
+    # --- Game metadata from header ---
+    header = data.get("header", {})
+    comp   = header.get("competitions", [{}])[0]
+    game_date = (comp.get("date") or "")[:10]
+
+    home_team = away_team = None
+    home_score = away_score = None
+    for c in comp.get("competitors", []):
+        name = _espn_canonical(c.get("team", {}).get("displayName", ""))
+        score_str = c.get("score")
+        score = int(score_str) if score_str and str(score_str).isdigit() else None
+        if c.get("homeAway") == "home":
+            home_team, home_score = name, score
+        else:
+            away_team, away_score = name, score
+
+    if not home_team or not away_team or not game_date:
+        return None
+
+    # --- Odds from pickcenter ---
+    pc = data.get("pickcenter", [])
+    if not pc:
+        # Return date so the caller can still break at the cutoff date.
+        return {"game_date": game_date, "no_odds": True}
+
+    p = pc[0]
+    home_odds = p.get("homeTeamOdds", {})
+    away_odds = p.get("awayTeamOdds", {})
+
+    ml_home = home_odds.get("moneyLine")
+    ml_away = away_odds.get("moneyLine")
+    home_fav = bool(home_odds.get("favorite", False))
+
+    if ml_home is None or ml_away is None:
+        return None
+
+    # Run line assignment: favourite gets -1.5, underdog gets +1.5
+    run_line_home = -1.5 if home_fav else +1.5
+    run_line_away = +1.5 if home_fav else -1.5
+
+    return {
+        "game_date":      game_date,
+        "home_team":      home_team,
+        "away_team":      away_team,
+        "home_score":     home_score,
+        "away_score":     away_score,
+        "run_line_home":  run_line_home,
+        "run_line_away":  run_line_away,
+        "ml_home":        float(ml_home),
+        "ml_away":        float(ml_away),
+        "over_under":     p.get("overUnder"),
+    }
+
+
+def fetch_mlb_odds_espn(
+    season: int,
+    request_delay: float = 0.25,
+    verbose: bool = True,
+    completed_dates: set[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch run lines and moneylines for completed regular-season MLB games via ESPN.
+
+    Only requests odds for games that have already been played.  Pass
+    `completed_dates` (set of 'YYYY-MM-DD' strings from the statsapi game
+    results) to skip future/unplayed games entirely — this cuts API calls by
+    ~60% mid-season and avoids wasting time on events with no pickcenter data.
+
+    Parameters
+    ----------
+    season           : Calendar year (e.g. 2023).
+    request_delay    : Seconds between requests (default 0.25 = ~4 req/s).
+    verbose          : Print progress every 250 games.
+    completed_dates  : Optional set of date strings ('YYYY-MM-DD') for which
+                       we have completed game results.  Events outside this set
+                       are skipped.  If None, all events are fetched (legacy
+                       behaviour for historical back-fills).
+
+    Returns
+    -------
+    DataFrame with columns: date, team, opponent, home, run_line, moneyline, over_under.
+    Returns empty DataFrame on failure.
+    """
+    import datetime as _dt
+    today_str = _dt.date.today().isoformat()
+
+    # Fast path: if only a few specific dates are needed, use the scoreboard
+    # endpoint to fetch event IDs per-date rather than pulling the full season list.
+    if completed_dates is not None and len(completed_dates) <= 7:
+        if verbose:
+            print(f"  Fetching ESPN event IDs for {len(completed_dates)} date(s) via scoreboard...")
+        event_ids = []
+        for d in sorted(completed_dates):
+            event_ids.extend(fetch_espn_event_ids_for_date(d))
+        if not event_ids:
+            print(f"  No event IDs found for the requested dates.")
+            return pd.DataFrame()
+    else:
+        if verbose:
+            print(f"  Fetching ESPN event IDs for {season}...")
+        event_ids = fetch_espn_event_ids(season)
+        if not event_ids:
+            print(f"  No event IDs found for {season}.")
+            return pd.DataFrame()
+
+    latest_completed = max(completed_dates) if completed_dates else today_str
+    filtered_ids = event_ids
+
+    n_total = len(filtered_ids)
+    if verbose:
+        scope = f"{sorted(completed_dates)}" if completed_dates and len(completed_dates) <= 7 else (f"up to {max(completed_dates)}" if completed_dates else "full season")
+        print(f"  {n_total} events — fetching odds ({scope})...")
+
+    records: list[dict] = []
+    errors  = 0
+    skipped = 0
+    latest_completed = max(completed_dates) if completed_dates else today_str
+    for i, eid in enumerate(filtered_ids):
+        game = fetch_espn_game_odds(eid)
+        if game is None:
+            errors += 1
+            continue
+
+        date = game["game_date"]
+        # Stop once we pass the last date we need — ESPN events are chronological.
+        if completed_dates is not None and date > latest_completed:
+            break
+        # No pickcenter odds (future game or no data) — date checked, skip record.
+        if game.get("no_odds"):
+            continue
+        if completed_dates is not None and date not in completed_dates:
+            continue
+        for team, opp, rl, ml, is_home in (
+            (game["home_team"], game["away_team"], game["run_line_home"], game["ml_home"], 1),
+            (game["away_team"], game["home_team"], game["run_line_away"], game["ml_away"], 0),
+        ):
+            records.append({
+                "date":       date,
+                "team":       team,
+                "opponent":   opp,
+                "home":       is_home,
+                "run_line":   rl,
+                "moneyline":  ml,
+                "over_under": game["over_under"],
+            })
+
+        if verbose and (i + 1) % 250 == 0:
+            print(f"    {i+1}/{n_total} events processed  ({errors} no-odds, {skipped} future skipped)")
+
+        time.sleep(request_delay)
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    if verbose:
+        pct = df["run_line"].notna().mean()
+        print(f"  Done. {len(df)//2} games, {pct:.1%} with run line data.")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# MLB — run-line odds via SBR web scrape (historical, no API key required)
+# ---------------------------------------------------------------------------
+
+_SBR_URL = "https://www.sportsbookreview.com/betting-odds/mlb-baseball/pointspread/full-game/?date={date}"
+_SBR_HDRS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+_SBR_TEAM_FIX: dict[str, str] = {
+    "Cleveland Indians":    "Cleveland Guardians",
+    "Oakland Athletics":    "Oakland Athletics",
+    "Athletics":            "Oakland Athletics",
+    "Tampa Bay Devil Rays": "Tampa Bay Rays",
+    "Anaheim Angels":       "Los Angeles Angels",
+    "Florida Marlins":      "Miami Marlins",
+    "Montreal Expos":       "Washington Nationals",
+}
+
+_SBR_BOOK_PREFERENCE = ["draftkings", "fanduel", "betmgm", "caesars", "pointsbet", "betonlineag"]
+
+
+def _sbr_canonical(name: str) -> str:
+    return _SBR_TEAM_FIX.get(name, name)
+
+
+def _sbr_best_line(odds_views: list) -> dict | None:
+    """Pick closing line from best available sportsbook. Returns None if no valid line."""
+    if not odds_views:
+        return None
+    views_by_book = {ov["sportsbook"]: ov for ov in odds_views if ov}
+    for book in _SBR_BOOK_PREFERENCE:
+        if book in views_by_book:
+            cl = views_by_book[book].get("currentLine") or {}
+            if cl.get("homeSpread") is not None and cl.get("homeOdds") is not None:
+                return cl
+    for ov in odds_views:
+        if not ov:
+            continue
+        cl = ov.get("currentLine") or {}
+        if cl.get("homeSpread") is not None and cl.get("homeOdds") is not None:
+            return cl
+    return None
+
+
+def _sbr_best_opening_line(odds_views: list) -> dict | None:
+    """Pick opening line from best available sportsbook. Returns None if no valid line."""
+    if not odds_views:
+        return None
+    views_by_book = {ov["sportsbook"]: ov for ov in odds_views if ov}
+    for book in _SBR_BOOK_PREFERENCE:
+        if book in views_by_book:
+            ol = views_by_book[book].get("openingLine") or {}
+            if ol.get("homeSpread") is not None and ol.get("homeOdds") is not None:
+                return ol
+    for ov in odds_views:
+        if not ov:
+            continue
+        ol = ov.get("openingLine") or {}
+        if ol.get("homeSpread") is not None and ol.get("homeOdds") is not None:
+            return ol
+    return None
+
+
+def fetch_mlb_odds_sbr_web(
+    date: str,
+    retries: int = 3,
+) -> pd.DataFrame:
+    """
+    Scrape MLB run-line closing odds for one date from sportsbookreview.com.
+
+    Parameters
+    ----------
+    date : 'YYYY-MM-DD'
+
+    Returns
+    -------
+    DataFrame with columns: date, team, opponent, home, run_line, moneyline.
+    Only rows where run_line is not None are returned.
+    """
+    import re as _re
+    url = _SBR_URL.format(date=date)
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers=_SBR_HDRS, timeout=15)
+            r.raise_for_status()
+            break
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+            else:
+                return pd.DataFrame()
+
+    m = _re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r.text, _re.DOTALL)
+    if not m:
+        return pd.DataFrame()
+
+    try:
+        data = json.loads(m.group(1))
+        game_rows = (
+            data["props"]["pageProps"]["oddsTables"][0]["oddsTableModel"]["gameRows"]
+        )
+    except (KeyError, IndexError, json.JSONDecodeError):
+        return pd.DataFrame()
+
+    records = []
+    for g in game_rows:
+        gv = g.get("gameView", {})
+        home_name = _sbr_canonical(gv.get("homeTeam", {}).get("fullName", ""))
+        away_name = _sbr_canonical(gv.get("awayTeam", {}).get("fullName", ""))
+        if not home_name or not away_name:
+            continue
+
+        odds_views = g.get("oddsViews") or []
+        cl = _sbr_best_line(odds_views)
+        if cl is None:
+            continue
+
+        home_spread = cl.get("homeSpread")
+        home_odds   = cl.get("homeOdds")
+        away_odds   = cl.get("awayOdds")
+
+        if home_spread is None or home_odds is None or away_odds is None:
+            continue
+
+        # Opening line from same sportsbook preference
+        ol = _sbr_best_opening_line(odds_views)
+        open_home_spread = ol.get("homeSpread") if ol else None
+        open_home_odds   = ol.get("homeOdds")   if ol else None
+        open_away_odds   = ol.get("awayOdds")   if ol else None
+
+        home_rec = {
+            "date":      date,
+            "team":      home_name,
+            "opponent":  away_name,
+            "home":      1,
+            "run_line":  float(home_spread),
+            "moneyline": float(home_odds),
+        }
+        away_rec = {
+            "date":      date,
+            "team":      away_name,
+            "opponent":  home_name,
+            "home":      0,
+            "run_line":  float(-home_spread),
+            "moneyline": float(away_odds),
+        }
+        if open_home_spread is not None and open_home_odds is not None and open_away_odds is not None:
+            home_rec["open_spread"]    = float(open_home_spread)
+            home_rec["open_moneyline"] = float(open_home_odds)
+            away_rec["open_spread"]    = float(-open_home_spread)
+            away_rec["open_moneyline"] = float(open_away_odds)
+
+        records.extend([home_rec, away_rec])
+
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------------------------
 # MLB — scores via statsapi (free, no key required)
 # ---------------------------------------------------------------------------
 
@@ -548,9 +1114,12 @@ _MLB_NAME_FIXES: dict[str, str] = {
 }
 
 
-def fetch_season_games_mlb(season: int) -> list[dict]:
+def fetch_season_games_mlb(
+    season: int,
+    since: str | None = None,
+) -> list[dict]:
     """
-    Fetch all regular-season MLB game results for a calendar year via statsapi.
+    Fetch regular-season MLB game results for a calendar year via statsapi.
 
     Returns a list of raw statsapi game dicts (only completed regular-season
     games with scores). Spring training and playoffs are excluded.
@@ -558,6 +1127,9 @@ def fetch_season_games_mlb(season: int) -> list[dict]:
     Parameters
     ----------
     season : Calendar year (e.g. 2023 for the 2023 MLB season).
+    since  : Optional 'YYYY-MM-DD' lower bound. When provided only games on or
+             after this date are fetched — use for nightly incremental updates
+             instead of re-pulling the full season each run.
     """
     try:
         import statsapi
@@ -565,10 +1137,26 @@ def fetch_season_games_mlb(season: int) -> list[dict]:
         raise ImportError("MLB-StatsAPI not installed. Run: pip install MLB-StatsAPI")
 
     # Regular season spans late March / early April through late September.
-    start = f"03/15/{season}"
-    end   = f"10/10/{season}"
+    season_start = f"03/15/{season}"
+    season_end   = f"10/10/{season}"
 
-    raw = statsapi.schedule(start_date=start, end_date=end, sportId=1)
+    if since is not None:
+        import datetime as _dt
+        since_dt = _dt.date.fromisoformat(since)
+        start = since_dt.strftime("%m/%d/%Y")
+    else:
+        start = season_start
+
+    import concurrent.futures as _cf
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(statsapi.schedule,
+                              start_date=start, end_date=season_end, sportId=1)
+            raw = _fut.result(timeout=60)
+    except _cf.TimeoutError:
+        raise RuntimeError(
+            "statsapi.schedule timed out after 60s — MLB Stats API may be down."
+        )
     return [
         g for g in raw
         if g.get("game_type") in _MLB_REGULAR_GAME_TYPES
@@ -581,6 +1169,7 @@ def fetch_season_games_mlb(season: int) -> list[dict]:
 def parse_game_results_mlb(
     raw_games: list[dict],
     season: int,
+    period_offsets: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     """
     Convert raw statsapi game dicts to the standard long-format DataFrame.
@@ -592,6 +1181,12 @@ def parse_game_results_mlb(
 
     period is assigned as sequential game number per team ordered by date,
     matching the NBA convention (1–162).
+
+    Parameters
+    ----------
+    period_offsets : optional dict mapping team name -> current max period in DB.
+        When provided, new periods continue from that offset instead of starting
+        at 1. Required for correct period assignment on incremental seeds.
     """
     from config import SPORTS
     sport = SPORTS["mlb"]
@@ -613,6 +1208,8 @@ def parse_game_results_mlb(
         home_sp = g.get("home_probable_pitcher") or ""
         away_sp = g.get("away_probable_pitcher") or ""
 
+        game_pk = str(g.get("game_id", ""))   # statsapi game ID for boxscore lookup
+
         for team, opp, score, opp_sc, is_home, sp_name in (
             (home, away, home_score, away_score, True,  home_sp),
             (away, home, away_score, home_score, False, away_sp),
@@ -624,6 +1221,7 @@ def parse_game_results_mlb(
                 "season":    season,
                 "period":    None,          # assigned below
                 "date":      game_date,
+                "game_pk":   game_pk,       # for boxscore / bullpen IP lookup
                 "score":     score,
                 "opp_score": opp_sc,
                 "diff":      score - opp_sc,
@@ -639,9 +1237,15 @@ def parse_game_results_mlb(
     # Apply regular-season date filter
     df = filter_regular_season(df, sport, season)
 
-    # Assign sequential game number per team by date
+    # Assign sequential game number per team by date.
+    # If period_offsets provided, continue from each team's existing max period
+    # so incremental seeds don't restart at 1.
     df = df.sort_values("date")
     df["period"] = df.groupby("team").cumcount() + 1
+    if period_offsets:
+        df["period"] = df.apply(
+            lambda r: r["period"] + period_offsets.get(r["team"], 0), axis=1
+        )
 
     return df.reset_index(drop=True)
 
@@ -672,15 +1276,18 @@ def fetch_mlb_pitcher_stats(season: int) -> pd.DataFrame:
         return pd.DataFrame()
 
     try:
-        result = statsapi.get("stats", {
-            "stats":       "season",
-            "group":       "pitching",
-            "sportId":     1,
-            "season":      season,
-            "gameType":    "R",
-            "limit":       1000,
-            "playerPool":  "ALL",    # include non-qualified starters
-        })
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(statsapi.get, "stats", {
+                "stats":       "season",
+                "group":       "pitching",
+                "sportId":     1,
+                "season":      season,
+                "gameType":    "R",
+                "limit":       1000,
+                "playerPool":  "ALL",
+            })
+            result = _fut.result(timeout=30)
     except Exception as exc:
         print(f"  fetch_mlb_pitcher_stats failed ({exc})")
         return pd.DataFrame()
@@ -688,6 +1295,17 @@ def fetch_mlb_pitcher_stats(season: int) -> pd.DataFrame:
     splits = result.get("stats", [{}])[0].get("splits", [])
     if not splits:
         return pd.DataFrame()
+
+    def _parse_ip(ip_str: str) -> float:
+        """Convert '180.2' (180 and 2/3 innings) to a float."""
+        s = str(ip_str or "0")
+        try:
+            if "." in s:
+                whole, frac = s.split(".", 1)
+                return int(whole) + int(frac) / 3.0
+            return float(s)
+        except (ValueError, TypeError):
+            return 0.0
 
     rows = []
     for s in splits:
@@ -697,13 +1315,16 @@ def fetch_mlb_pitcher_stats(season: int) -> pd.DataFrame:
         if not name:
             continue
         try:
+            gs = int(stat.get("gamesStarted", 0) or 0)
+            ip = _parse_ip(stat.get("inningsPitched", "0"))
             rows.append({
                 "name":  name,
                 "era":   float(stat.get("era", "nan") or "nan"),
                 "whip":  float(stat.get("whip", "nan") or "nan"),
                 "k9":    float(stat.get("strikeoutsPer9Inn", "nan") or "nan"),
                 "bb9":   float(stat.get("walksPer9Inn", "nan") or "nan"),
-                "gs":    int(stat.get("gamesStarted", 0) or 0),
+                "gs":    gs,
+                "ip":    ip,
             })
         except (ValueError, TypeError):
             continue
@@ -711,10 +1332,422 @@ def fetch_mlb_pitcher_stats(season: int) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows).set_index("name")
-    # Keep only pitchers with at least 1 start (filters out pure relievers)
-    df = df[df["gs"] >= 1].drop(columns=["gs"])
+    df = pd.DataFrame(rows)
+    # Normalize names to handle accent/encoding mismatches between statsapi
+    # schedule (which returns "Eury Pérez") and stats endpoint.
+    # Keep original name for display; use normalized key as index.
+    df["name_key"] = df["name"].apply(_normalize_pitcher_name)
+    df = df.set_index("name_key")
+
+    # Minimum IP filter — pitchers with very few innings have unreliable ERAs
+    # (e.g. 4 ER in 1.1 IP = 27.00 ERA). Require at least 10 IP for a
+    # meaningful sample. This keeps high-usage relievers who transition to
+    # starting roles while dropping one-game cup-of-coffee appearances.
+    df = df[df["ip"] >= 10].copy()
+
+    # ip_per_start is NaN for pure relievers (gs == 0) which is fine.
+    df["ip_per_start"] = (df["ip"] / df["gs"]).where(df["gs"] > 0)
+    df = df.drop(columns=["gs", "ip", "name"])
     return df
+
+
+def fetch_mlb_bullpen_stats(season: int) -> pd.DataFrame:
+    """
+    Fetch team-level bullpen stats for a season via statsapi.
+
+    Aggregates individual reliever stats (gamesStarted == 0) to the team
+    level, weighted by innings pitched.  Use season-1 when building features
+    to avoid leakage.
+
+    Parameters
+    ----------
+    season : The season to pull stats from.
+
+    Returns
+    -------
+    DataFrame indexed by team name with columns:
+        bp_era, bp_whip, bp_k9, bp_hr9
+
+    Returns empty DataFrame on failure.
+    """
+    try:
+        import statsapi
+    except ImportError:
+        print("  MLB-StatsAPI not installed.")
+        return pd.DataFrame()
+
+    try:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _fut = _ex.submit(statsapi.get, "stats", {
+                "stats":      "season",
+                "group":      "pitching",
+                "sportId":    1,
+                "season":     season,
+                "gameType":   "R",
+                "limit":      2000,
+                "playerPool": "ALL",
+            })
+            raw = _fut.result(timeout=30)
+    except Exception as exc:
+        print(f"  fetch_mlb_bullpen_stats failed ({exc})")
+        return pd.DataFrame()
+
+    splits = raw.get("stats", [{}])[0].get("splits", [])
+    if not splits:
+        return pd.DataFrame()
+
+    def _parse_ip(ip_str: str) -> float:
+        """Convert '45.2' (45 and 2/3 innings) to a float."""
+        ip_str = str(ip_str or "0")
+        try:
+            if "." in ip_str:
+                whole, frac = ip_str.split(".", 1)
+                return int(whole) + int(frac) / 3.0
+            return float(ip_str)
+        except (ValueError, TypeError):
+            return 0.0
+
+    rows = []
+    for s in splits:
+        stat = s.get("stat", {})
+        team = s.get("team", {}).get("name", "")
+        if not team:
+            continue
+        gs = int(stat.get("gamesStarted", 0) or 0)
+        if gs > 0:
+            continue  # starters handled separately
+        ip = _parse_ip(stat.get("inningsPitched", "0"))
+        if ip < 5:
+            continue  # ignore cup-of-coffee appearances
+        try:
+            rows.append({
+                "team": team,
+                "ip":   ip,
+                "era":  float(stat.get("era",  "nan") or "nan"),
+                "whip": float(stat.get("whip", "nan") or "nan"),
+                "k9":   float(stat.get("strikeoutsPer9Inn", "nan") or "nan"),
+                "hr9":  float(stat.get("homeRunsPer9",      "nan") or "nan"),
+            })
+        except (ValueError, TypeError):
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # Aggregate to team level, innings-pitched weighted
+    def _wmean(grp: pd.DataFrame, col: str) -> float:
+        w = grp["ip"]
+        v = grp[col]
+        valid = v.notna() & w.notna()
+        denom = w[valid].sum()
+        if denom == 0:
+            return float("nan")
+        return float((v[valid] * w[valid]).sum() / denom)
+
+    # MLB teams play 162 games — use this to normalise total bullpen IP
+    _GAMES_PER_SEASON = 162.0
+
+    team_rows = []
+    for team, grp in df.groupby("team"):
+        total_bp_ip = grp["ip"].sum()
+        team_rows.append({
+            "team":           team,
+            "bp_era":         _wmean(grp, "era"),
+            "bp_whip":        _wmean(grp, "whip"),
+            "bp_k9":          _wmean(grp, "k9"),
+            "bp_hr9":         _wmean(grp, "hr9"),
+            # Avg innings per game the bullpen pitches — high = heavily used pen
+            "bp_ip_per_game": round(total_bp_ip / _GAMES_PER_SEASON, 3),
+        })
+
+    return pd.DataFrame(team_rows).set_index("team")
+
+
+def fetch_game_bp_ip(game_pk: str) -> dict[str, float]:
+    """
+    Fetch per-team bullpen innings pitched for a single completed game.
+
+    Uses statsapi.boxscore_data(game_pk) — free, no key required.
+
+    Parameters
+    ----------
+    game_pk : statsapi game ID (stored as 'game_pk' in MongoDB game docs).
+
+    Returns
+    -------
+    Dict mapping team name → bullpen IP for that game.
+    e.g. {'New York Yankees': 3.667, 'Boston Red Sox': 2.0}
+    Returns empty dict on failure.
+    """
+    try:
+        import statsapi
+    except ImportError:
+        return {}
+
+    try:
+        box = statsapi.boxscore_data(int(game_pk))
+    except Exception:
+        return {}
+
+    def _parse_ip(ip_str) -> float:
+        """Convert statsapi IP string (e.g. '4.1' = 4⅓) to decimal innings."""
+        s = str(ip_str or "0").strip()
+        if not s or s in ("IP", "-", ""):
+            return 0.0
+        try:
+            if "." in s:
+                whole, frac = s.split(".", 1)
+                return int(whole) + int(frac) / 3.0
+            return float(s)
+        except (ValueError, TypeError):
+            return 0.0
+
+    # Abbreviation → full team name for the current statsapi response format.
+    # The old format used homeTeamStats.teamInfo.team.name (full name).
+    # The new format uses teamInfo.home.abbreviation + teamName.
+    _ABBREV_TO_FULL: dict[str, str] = {
+        "AZ":  "Arizona Diamondbacks",   "ATL": "Atlanta Braves",
+        "BAL": "Baltimore Orioles",       "BOS": "Boston Red Sox",
+        "CHC": "Chicago Cubs",            "CWS": "Chicago White Sox",
+        "CIN": "Cincinnati Reds",         "CLE": "Cleveland Guardians",
+        "COL": "Colorado Rockies",        "DET": "Detroit Tigers",
+        "HOU": "Houston Astros",          "KC":  "Kansas City Royals",
+        "LAA": "Los Angeles Angels",      "LAD": "Los Angeles Dodgers",
+        "MIA": "Miami Marlins",           "MIL": "Milwaukee Brewers",
+        "MIN": "Minnesota Twins",         "NYM": "New York Mets",
+        "NYY": "New York Yankees",        "ATH": "Athletics",
+        "OAK": "Athletics",               "PHI": "Philadelphia Phillies",
+        "PIT": "Pittsburgh Pirates",      "SD":  "San Diego Padres",
+        "SF":  "San Francisco Giants",    "SEA": "Seattle Mariners",
+        "STL": "St. Louis Cardinals",     "TB":  "Tampa Bay Rays",
+        "TEX": "Texas Rangers",           "TOR": "Toronto Blue Jays",
+        "WSH": "Washington Nationals",    "WAS": "Washington Nationals",
+    }
+
+    def _resolve_team_name(side: str) -> str:
+        """Try new teamInfo format first, fall back to old homeTeamStats format."""
+        # New format: box['teamInfo']['home']['abbreviation']
+        abbrev = box.get("teamInfo", {}).get(side, {}).get("abbreviation", "")
+        if abbrev and abbrev in _ABBREV_TO_FULL:
+            return _ABBREV_TO_FULL[abbrev]
+        # Old format: box['homeTeamStats']['teamInfo']['team']['name']
+        old_name = (
+            box.get(f"{side}TeamStats", {})
+               .get("teamInfo", {})
+               .get("team", {})
+               .get("name", "")
+        )
+        return _MLB_NAME_FIXES.get(old_name, old_name)
+
+    result: dict[str, float] = {}
+    for side in ("home", "away"):
+        team_name = _resolve_team_name(side)
+        pitchers  = box.get(f"{side}Pitchers", [])
+
+        # Filter to real pitcher rows (skip the header row where personId=0)
+        real_pitchers = [p for p in pitchers if p.get("personId", 0) != 0]
+
+        bp_ip = 0.0
+        for i, p in enumerate(real_pitchers):
+            # IP key changed from 'inningsPitched' to 'ip' in newer statsapi versions
+            ip_val  = p.get("ip") or p.get("inningsPitched") or "0"
+            ip      = _parse_ip(ip_val)
+
+            # Identify starter: first pitcher listed who threw > 2 IP.
+            # Opener strategy: if first pitcher threw ≤ 2 IP, they are a relief
+            # opener — do NOT skip them; the true starter follows.
+            if i == 0 and ip > 2.0:
+                continue   # skip starter
+
+            bp_ip += ip
+
+        if team_name:
+            result[team_name] = round(bp_ip, 3)
+
+    return result
+
+
+def fetch_game_sp_stats(game_pk: str) -> dict[str, dict]:
+    """
+    Fetch starting pitcher stats for a single completed game.
+
+    Uses the same boxscore_data call as fetch_game_bp_ip — no extra API cost
+    if called together.  Identifies the starter using the same heuristic:
+    first pitcher who threw > 2 IP (opener rule: ≤ 2 IP = relief opener,
+    true starter follows).
+
+    Parameters
+    ----------
+    game_pk : statsapi game ID.
+
+    Returns
+    -------
+    Dict mapping team name → {'sp_name': str, 'sp_ip_game': float, 'sp_er_game': int}
+    Returns empty dict on failure.
+    """
+    try:
+        import statsapi
+    except ImportError:
+        return {}
+
+    try:
+        box = statsapi.boxscore_data(int(game_pk))
+    except Exception:
+        return {}
+
+    def _parse_ip(ip_str) -> float:
+        s = str(ip_str or "0").strip()
+        if not s or s in ("IP", "-", ""):
+            return 0.0
+        try:
+            if "." in s:
+                whole, frac = s.split(".", 1)
+                return int(whole) + int(frac) / 3.0
+            return float(s)
+        except (ValueError, TypeError):
+            return 0.0
+
+    _ABBREV_TO_FULL: dict[str, str] = {
+        "AZ":  "Arizona Diamondbacks",   "ATL": "Atlanta Braves",
+        "BAL": "Baltimore Orioles",       "BOS": "Boston Red Sox",
+        "CHC": "Chicago Cubs",            "CWS": "Chicago White Sox",
+        "CIN": "Cincinnati Reds",         "CLE": "Cleveland Guardians",
+        "COL": "Colorado Rockies",        "DET": "Detroit Tigers",
+        "HOU": "Houston Astros",          "KC":  "Kansas City Royals",
+        "LAA": "Los Angeles Angels",      "LAD": "Los Angeles Dodgers",
+        "MIA": "Miami Marlins",           "MIL": "Milwaukee Brewers",
+        "MIN": "Minnesota Twins",         "NYM": "New York Mets",
+        "NYY": "New York Yankees",        "ATH": "Athletics",
+        "OAK": "Athletics",               "PHI": "Philadelphia Phillies",
+        "PIT": "Pittsburgh Pirates",      "SD":  "San Diego Padres",
+        "SF":  "San Francisco Giants",    "SEA": "Seattle Mariners",
+        "STL": "St. Louis Cardinals",     "TB":  "Tampa Bay Rays",
+        "TEX": "Texas Rangers",           "TOR": "Toronto Blue Jays",
+        "WSH": "Washington Nationals",    "WAS": "Washington Nationals",
+    }
+
+    def _resolve_team(side: str) -> str:
+        abbrev = box.get("teamInfo", {}).get(side, {}).get("abbreviation", "")
+        if abbrev and abbrev in _ABBREV_TO_FULL:
+            return _ABBREV_TO_FULL[abbrev]
+        old_name = (
+            box.get(f"{side}TeamStats", {})
+               .get("teamInfo", {}).get("team", {}).get("name", "")
+        )
+        return _MLB_NAME_FIXES.get(old_name, old_name)
+
+    result: dict[str, dict] = {}
+    for side in ("home", "away"):
+        team_name = _resolve_team(side)
+        pitchers  = box.get(f"{side}Pitchers", [])
+        real      = [p for p in pitchers if p.get("personId", 0) != 0]
+
+        # Find the starter: first pitcher who threw > 2 IP.
+        # If first threw ≤ 2 IP (opener), skip them and take the next.
+        starter = None
+        for i, p in enumerate(real):
+            ip_val = p.get("ip") or p.get("inningsPitched") or "0"
+            ip = _parse_ip(ip_val)
+            if i == 0 and ip <= 2.0:
+                continue  # opener — skip, true starter follows
+            starter = p
+            break
+
+        if starter and team_name:
+            ip_val  = starter.get("ip") or starter.get("inningsPitched") or "0"
+            er_val  = starter.get("er") or starter.get("earnedRuns") or 0
+
+            # Always resolve full name from the players dict — the pitcher
+            # row's 'name' field is abbreviated (last name only).
+            pid = starter.get("personId", 0)
+            sp_name = (
+                box.get(f"{side}", {})
+                   .get("players", {})
+                   .get(f"ID{pid}", {})
+                   .get("person", {})
+                   .get("fullName", "")
+                or starter.get("name", "")   # fallback to abbreviated name
+            )
+
+            result[team_name] = {
+                "sp_name":    sp_name,
+                "sp_ip_game": round(_parse_ip(ip_val), 3),
+                "sp_er_game": int(er_val) if er_val is not None else 0,
+            }
+
+    return result
+
+
+def fetch_season_sp_stats(
+    season: int,
+    game_pks: list[str],
+    request_delay: float = 0.25,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetch per-game starting pitcher stats for all games in a season.
+
+    Returns
+    -------
+    DataFrame with columns: game_pk, team, sp_name, sp_ip_game, sp_er_game
+    """
+    rows = []
+    errors = 0
+    for i, pk in enumerate(game_pks):
+        result = fetch_game_sp_stats(pk)
+        if result:
+            for team, stats in result.items():
+                rows.append({"game_pk": pk, "team": team, **stats})
+        else:
+            errors += 1
+        if verbose and (i + 1) % 250 == 0:
+            print(f"    {i+1}/{len(game_pks)} games processed ({errors} errors)")
+        time.sleep(request_delay)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def fetch_season_bp_ip(
+    season: int,
+    game_pks: list[str],
+    request_delay: float = 0.25,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetch per-game bullpen IP for all games in a season.
+
+    Parameters
+    ----------
+    season       : Season year (for display only).
+    game_pks     : List of game_pk strings (from MongoDB game docs).
+    request_delay: Seconds between statsapi calls (default 0.25).
+    verbose      : Print progress every 250 games.
+
+    Returns
+    -------
+    DataFrame with columns: game_pk, team, bp_ip_game
+    """
+    rows = []
+    errors = 0
+    for i, pk in enumerate(game_pks):
+        result = fetch_game_bp_ip(pk)
+        if result:
+            for team, ip in result.items():
+                rows.append({"game_pk": pk, "team": team, "bp_ip_game": ip})
+        else:
+            errors += 1
+        if verbose and (i + 1) % 250 == 0:
+            print(f"    {i+1}/{len(game_pks)} games processed ({errors} errors)")
+        time.sleep(request_delay)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------

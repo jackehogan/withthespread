@@ -12,7 +12,6 @@ without a spread line); XGBoost handles these natively.
 Context features added for the target period:
   home   : 1 if the team is playing at home, 0 if away
   is_b2b : 1 if the team played the previous day (back-to-back), else 0
-  spread : the game's spread line (encodes the market's prior expectation)
 
 The `team` identifier is intentionally excluded from the feature matrix to
 prevent the model memorising team identities instead of learning form patterns.
@@ -32,8 +31,8 @@ Public interface
 build_features(games_df, next_period, lookback, eval_season, eval_split_period)
 build_prediction_features(season_games, next_period, lookback, season)
 train_models(games_df, next_period, eval_season, eval_split_period, max_evals)
-    -> reg, clas, scores, best_lookback
-predict(reg, clas, X_pred)
+    -> clf, scores, best_lookback
+predict(clf, X_pred)
 """
 
 from __future__ import annotations
@@ -41,9 +40,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from hyperopt import fmin, hp, tpe
-from sklearn.model_selection import cross_val_score
-from scipy.stats import norm
-from xgboost import XGBClassifier, XGBRegressor
+from sklearn.model_selection import cross_val_score, KFold
+from xgboost import XGBClassifier
 
 import embeddings as emb
 import elo as elo_mod
@@ -53,8 +51,10 @@ _XGB_FIXED = {"enable_categorical": True, "tree_method": "hist"}
 # team and season excluded — see module docstring
 _CAT_COLS = ("period",)
 
-_LOOKBACK_CANDIDATES = [3, 5, 7, 10, 15]
-_K_CANDIDATES        = [16, 32, 48, 64]
+_LOOKBACK_CANDIDATES     = [7, 10, 15]
+_K_CANDIDATES            = [16, 32, 48, 64]
+_ELO_WINDOW              = 20    # EDA showed 20-game window has ~8x signal vs full-season cumulative
+_BP_FATIGUE_DAYS         = 14    # fixed rolling window for bp_ip_14d — not a hyperparameter
 
 _HYPEROPT_SPACE = {
     "learning_rate": hp.uniform("learning_rate", 0.01, 0.3),
@@ -110,7 +110,7 @@ def _precompute(
     train_elo_by_k = {}
     eval_elo_by_k  = {}
     for k in k_values:
-        er = elo_mod.compute(games_df, k=k)
+        er = elo_mod.compute(games_df, k=k, window=_ELO_WINDOW)
         elo_by_k[k]       = er
         _eval_mask = er.index.get_level_values("season") == eval_season
         train_elo_by_k[k] = er[~_eval_mask]
@@ -186,7 +186,20 @@ def _precompute(
     eval_n_prior_by_target:  dict[int, int] = {}
 
     all_targets = sorted(set(train_ss.columns) | set(eval_ss.columns))
-    _CTX = ["home", "is_b2b", "spread"]
+    # Must match _CTX_COLS in _collect_window — all context columns that the
+    # training feature matrix should contain.  Expanding this beyond ["home","is_b2b"]
+    # is the fix for pitcher/bullpen/matchup stats being absent from training data.
+    # bp_ip_14d is included here as a NaN placeholder; _apply_bp overwrites it.
+    _CTX = [
+        "home", "is_b2b",
+        "sp_era", "sp_whip", "sp_k9", "sp_ip_per_start",
+        "opp_sp_era", "opp_sp_whip", "sp_era_edge",
+        "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
+        "bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game",
+        "opp_bp_era", "opp_bp_whip", "bp_era_edge",
+        "ml_implied_prob",
+        "bp_ip_14d",
+    ]
 
     def _add_elo(df_base, common, elo_by_p, target):
         elo_grp = elo_by_p.get(target)
@@ -219,7 +232,7 @@ def _precompute(
                     for col in df_k.columns:
                         if col not in _CAT_COLS:
                             df_k[col] = pd.to_numeric(df_k[col], errors="coerce")
-                    train_feats_by_k_target[k][target] = (df_k, pd.Series(y_tr.values, dtype=float))
+                    train_feats_by_k_target[k][target] = (df_k, pd.Series((y_tr.values > 0).astype(int), dtype=float), common)
 
         # --- eval split ---
         if target in eval_ss.columns:
@@ -244,7 +257,7 @@ def _precompute(
                     for col in df_k.columns:
                         if col not in _CAT_COLS:
                             df_k[col] = pd.to_numeric(df_k[col], errors="coerce")
-                    eval_feats_by_k_target[k][target] = (df_k, pd.Series(y_ev.values, dtype=float))
+                    eval_feats_by_k_target[k][target] = (df_k, pd.Series((y_ev.values > 0).astype(int), dtype=float), common)
 
     return {
         "elo_by_k":                elo_by_k,
@@ -308,11 +321,11 @@ def build_features(
         for start in range(1, next_period - lookback + 1):
             target = start + lookback
             if target in train_feats and train_n_prior.get(target, 0) >= lookback:
-                df, y = train_feats[target]
+                df, y, _ = train_feats[target]
                 X_train_parts.append(df)
                 y_train_parts.append(y)
             if target in eval_feats and eval_n_prior.get(target, 0) >= lookback:
-                df, y = eval_feats[target]
+                df, y, _ = eval_feats[target]
                 if target < eval_split_period:
                     X_test_parts.append(df)
                     y_test_parts.append(y)
@@ -360,7 +373,7 @@ def build_features(
         train_ctx = context[~context.index.get_level_values("season").isin([eval_season])]
         eval_ctx  = context[context.index.get_level_values("season") == eval_season]
 
-        elo_ratings = elo_mod.compute(games_df, k=best_k)
+        elo_ratings = elo_mod.compute(games_df, k=best_k, window=_ELO_WINDOW)
         train_elo   = elo_ratings[
             ~elo_ratings.index.get_level_values("season").isin([eval_season])
         ]
@@ -454,35 +467,69 @@ def _recast_categoricals(df: pd.DataFrame) -> None:
             df[col] = df[col].astype("category")
 
 
+def _american_to_raw_prob(ml) -> float:
+    """
+    Convert American moneyline odds to raw implied probability (includes vig).
+
+    Examples
+    --------
+    -150  →  150 / 250  = 0.600
+    +130  →  100 / 230  = 0.435
+    """
+    try:
+        ml = float(ml)
+    except (TypeError, ValueError):
+        return float("nan")
+    if np.isnan(ml):
+        return float("nan")
+    if ml < 0:
+        return abs(ml) / (abs(ml) + 100.0)
+    else:
+        return 100.0 / (ml + 100.0)
+
+
 def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute per-(team, season, period) context features:
       home              : 1 if playing at home, 0 if away
       is_b2b            : 1 if the team played yesterday, else 0
       spread            : game spread line (NaN if unavailable)
-      off_rating        : team's cumulative offensive rating through prior period
-      def_rating        : team's cumulative defensive rating through prior period
-      net_rating        : team's cumulative net rating through prior period
-      opp_off_rating    : opponent's off_rating (same period)
-      opp_def_rating    : opponent's def_rating (same period)
-      matchup_off_edge  : team off_rating - opp def_rating (offensive advantage)
-      matchup_def_edge  : team def_rating - opp off_rating (defensive advantage, lower = better)
+      sp_era            : starting pitcher ERA (prior season)
+      sp_whip           : starting pitcher WHIP (prior season)
+      sp_k9             : starting pitcher K/9 (prior season)
+      opp_sp_era        : opponent's starting pitcher ERA (same period)
+      opp_sp_whip       : opponent's starting pitcher WHIP (same period)
+      sp_era_edge       : opp_sp_era - sp_era (positive = our starter is better)
+      bp_era            : team bullpen ERA (prior season)
+      bp_whip           : team bullpen WHIP (prior season)
+      bp_k9             : team bullpen K/9 (prior season)
+      bp_hr9            : team bullpen HR/9 (prior season)
+      opp_bp_era        : opponent bullpen ERA (same period)
+      opp_bp_whip       : opponent bullpen WHIP (same period)
+      bp_era_edge       : opp_bp_era - bp_era (positive = our bullpen is better)
+      ml_implied_prob   : no-vig implied probability from run-line moneyline
+      bp_ip_14d         : rolling N-day bullpen fatigue (filled separately if seeded)
 
     Returns a DataFrame indexed by (team, season, period).
     """
-    # spread_juice, total, implied_prob excluded until historical odds are backfilled
-    # off_rating / def_rating / net_rating populated once nba_api ratings are seeded
     # sp_era / sp_whip / sp_k9 populated for MLB once pitcher stats are seeded
-    _RATING_COLS  = ["off_rating", "def_rating", "net_rating"]
-    _PITCHER_COLS = ["sp_era", "sp_whip", "sp_k9"]
-    _CTX_ODDS     = ["spread"] + _RATING_COLS + _PITCHER_COLS
+    # bp_era / bp_whip / bp_k9 / bp_hr9 populated for MLB bullpen stats
+    # ml_implied_prob computed from stored moneyline (no-vig, both sides normalised)
+    _PITCHER_COLS = ["sp_era", "sp_whip", "sp_k9", "sp_ip_per_start"]
+    _BULLPEN_COLS = ["bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game"]
+    # moneyline loaded for ml_implied_prob computation but not output as a raw feature
+    _CTX_ODDS     = ["spread", "moneyline"] + _PITCHER_COLS + _BULLPEN_COLS
+    _CTX_FEAT     = ["spread"] + _PITCHER_COLS + _BULLPEN_COLS  # features only
 
     needed = {"team", "season", "period", "date", "home"}
     _matchup_cols = [
-        "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge",
         "opp_sp_era", "opp_sp_whip", "sp_era_edge",
+        "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
+        "opp_bp_era", "opp_bp_whip", "bp_era_edge",
+        "ml_implied_prob",
+        "bp_ip_14d",   # rolling N-day bullpen fatigue (seeded separately)
     ]
-    _all_out = ["home", "is_b2b"] + _CTX_ODDS + _matchup_cols
+    _all_out = ["home", "is_b2b"] + _CTX_FEAT + _matchup_cols
 
     if not needed.issubset(games_df.columns):
         idx = pd.MultiIndex.from_frame(games_df[["team", "season", "period"]])
@@ -507,10 +554,10 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
             df[c] = np.nan
 
     # --- Opponent matchup features ---
-    # Build a lookup: (team, season, period) -> off_rating, def_rating, sp_era, sp_whip
-    ratings_have  = [c for c in ["off_rating", "def_rating"] if c in df.columns]
+    # Build a lookup: (team, season, period) -> sp_era, sp_whip, bp_era, bp_whip
     pitchers_have = [c for c in ["sp_era", "sp_whip"] if c in df.columns]
-    lookup_cols   = ratings_have + pitchers_have
+    bullpen_have  = [c for c in ["bp_era", "bp_whip"] if c in df.columns]
+    lookup_cols   = pitchers_have + bullpen_have
 
     if opp_present and lookup_cols:
         matchup_lookup = df.set_index(["team", "season", "period"])[lookup_cols]
@@ -518,28 +565,225 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
         opp_vals = matchup_lookup.reindex(opp_keys)
         opp_vals.index = df.index
 
-        if "off_rating" in ratings_have:
-            df["opp_off_rating"] = opp_vals["off_rating"].values
-        if "def_rating" in ratings_have:
-            df["opp_def_rating"] = opp_vals["def_rating"].values
-
-        # NBA matchup edges
-        if "off_rating" in ratings_have and "def_rating" in ratings_have:
-            df["matchup_off_edge"] = df["off_rating"] - df["opp_def_rating"]
-            df["matchup_def_edge"] = df["def_rating"] - df["opp_off_rating"]
-
-        # MLB pitcher matchup edges (lower ERA = better pitcher, so self - opp)
+        # MLB starter matchup edges (lower ERA = better pitcher)
         if "sp_era" in pitchers_have:
             df["opp_sp_era"]  = opp_vals["sp_era"].values
-            df["sp_era_edge"] = df["opp_sp_era"] - df["sp_era"]   # positive = our pitcher is better
+            df["sp_era_edge"] = df["opp_sp_era"] - df["sp_era"]   # positive = our starter is better
         if "sp_whip" in pitchers_have:
             df["opp_sp_whip"] = opp_vals["sp_whip"].values
+
+        # MLB bullpen matchup edges (lower ERA = better bullpen)
+        if "bp_era" in bullpen_have:
+            df["opp_bp_era"]  = opp_vals["bp_era"].values
+            df["bp_era_edge"] = df["opp_bp_era"] - df["bp_era"]   # positive = our bullpen is better
+        if "bp_whip" in bullpen_have:
+            df["opp_bp_whip"] = opp_vals["bp_whip"].values
     else:
         for c in _matchup_cols:
             df[c] = np.nan
 
+    # --- Moneyline implied probability (no-vig) ---
+    # Each row stores the team's run-line moneyline. We look up the opponent's
+    # moneyline for the same game, then normalise both sides to remove the vig.
+    # Result: 0.5 = market sees a coin flip, >0.5 = this team is favoured to cover.
+    if "moneyline" in df.columns and opp_present:
+        ml_lookup = df.set_index(["team", "season", "period"])["moneyline"]
+        opp_ml_keys = list(zip(df["opponent"], df["season"], df["period"]))
+        opp_ml = ml_lookup.reindex(opp_ml_keys)
+        opp_ml.index = df.index
+
+        p_self = df["moneyline"].apply(_american_to_raw_prob)
+        p_opp  = opp_ml.apply(_american_to_raw_prob)
+        total  = p_self + p_opp
+        # Avoid division by zero when both sides are NaN
+        df["ml_implied_prob"] = (p_self / total).where(total > 0)
+    else:
+        df["ml_implied_prob"] = np.nan
+
+    # --- Rolling bullpen fatigue (bp_ip_14d) ---
+    # Computed directly here using the fixed window so it flows through the
+    # same single code path as every other context feature.
+    _bp_fat  = _compute_bp_fatigue(games_df, _BP_FATIGUE_DAYS)
+    _bp_dict = _bp_fat.to_dict()
+    df["bp_ip_14d"] = [
+        _bp_dict.get((t, s, p), np.nan)
+        for t, s, p in zip(df["team"], df["season"], df["period"])
+    ]
+
+    # --- Rolling 5-start SP ERA ---
+    # Per-pitcher rolling ERA computed from in-season boxscore data (sp_ip_game,
+    # sp_er_game). Falls back to prior-season sp_era for first 2 starts or when
+    # boxscore data hasn't been seeded. This replaces the static prior-season
+    # value as the primary starter quality signal.
+    _sp_roll     = _compute_sp_rolling_era(games_df, n_starts=5, fallback_col="sp_era")
+    _sp_roll_dict = _sp_roll.to_dict()
+    df["sp_era_rolling"] = [
+        _sp_roll_dict.get((t, s, p), np.nan)
+        for t, s, p in zip(df["team"], df["season"], df["period"])
+    ]
+
+    # Opponent rolling ERA and edge
+    if opp_present:
+        opp_keys = list(zip(df["opponent"], df["season"], df["period"]))
+        df["opp_sp_era_rolling"] = [_sp_roll_dict.get(k, np.nan) for k in opp_keys]
+        df["sp_era_rolling_edge"] = (
+            df["opp_sp_era_rolling"].astype(float) - df["sp_era_rolling"].astype(float)
+        )
+    else:
+        df["opp_sp_era_rolling"] = np.nan
+        df["sp_era_rolling_edge"] = np.nan
+
+    # Clip implausible ERA values — a prior-season ERA > 10 indicates a pitcher
+    # with fewer than ~10 IP (e.g. 4 ER in 1 IP relief = 36.00). These are not
+    # meaningful starter quality signals. Null them out so XGBoost treats them
+    # as missing rather than as extreme numeric inputs.
+    for _era_col in ["sp_era", "opp_sp_era", "bp_era", "opp_bp_era"]:
+        if _era_col in df.columns:
+            df.loc[df[_era_col] > 10, _era_col] = np.nan
+            df.loc[df[_era_col] == 0, _era_col] = np.nan
+
     out_cols = [c for c in _all_out if c in df.columns]
     return df.set_index(["team", "season", "period"])[out_cols]
+
+
+def _compute_sp_rolling_era(
+    games_df: pd.DataFrame,
+    n_starts: int = 5,
+    fallback_col: str = "sp_era",
+) -> pd.Series:
+    """
+    Compute rolling n-start ERA for each starting pitcher.
+
+    For each game row, looks back at the previous `n_starts` appearances by
+    the same pitcher in the same season and computes ERA = sum(ER)/sum(IP)*9.
+    Requires 'sp_ip_game' and 'sp_er_game' columns (seeded by --sp-game-stats).
+
+    Falls back to prior-season `sp_era` when:
+      - fewer than 2 starts of in-season data are available (season opener)
+      - sp_ip_game / sp_er_game not present in games_df
+
+    Returns a Series indexed by (team, season, period) named 'sp_era_rolling'.
+    """
+    idx = pd.MultiIndex.from_frame(games_df[["team", "season", "period"]])
+    result = pd.Series(np.nan, index=idx, name="sp_era_rolling")
+
+    if "sp_ip_game" not in games_df.columns or "sp_er_game" not in games_df.columns:
+        # Fall back to prior-season ERA for all rows
+        if fallback_col in games_df.columns:
+            result = games_df.set_index(["team", "season", "period"])[fallback_col].rename("sp_era_rolling")
+        return result
+
+    # Work on rows that have a sp_name and sp_ip_game
+    df = games_df[["team", "season", "period", "date", "sp_name",
+                   "sp_ip_game", "sp_er_game"]].copy()
+    if fallback_col in games_df.columns:
+        df[fallback_col] = games_df[fallback_col].values
+
+    df = df.sort_values(["sp_name", "season", "date"])
+    df["sp_ip_game"] = pd.to_numeric(df["sp_ip_game"], errors="coerce")
+    df["sp_er_game"] = pd.to_numeric(df["sp_er_game"], errors="coerce")
+
+    rolling_eras = {}   # (team, season, period) -> rolling ERA
+
+    for (sp_name, season_val), grp in df.groupby(["sp_name", "season"]):
+        if not sp_name:
+            continue
+        grp = grp.sort_values("date").reset_index(drop=True)
+
+        for i, row in grp.iterrows():
+            key = (row["team"], season_val, int(row["period"]))
+            # Prior starts in this season for this pitcher (exclude current game)
+            prior = grp.iloc[:i].dropna(subset=["sp_ip_game", "sp_er_game"])
+            prior = prior[prior["sp_ip_game"] > 0]
+
+            if len(prior) >= 2:
+                # Use last n_starts starts (or all available if fewer)
+                window = prior.tail(n_starts)
+                total_ip = window["sp_ip_game"].sum()
+                total_er = window["sp_er_game"].sum()
+                if total_ip > 0:
+                    rolling_eras[key] = round(total_er / total_ip * 9, 3)
+                    continue
+
+            # Fallback: use prior-season ERA
+            if fallback_col in row.index and pd.notna(row[fallback_col]):
+                rolling_eras[key] = row[fallback_col]
+
+    for key, val in rolling_eras.items():
+        if key in result.index:
+            result[key] = val
+
+    return result
+
+
+def _compute_bp_fatigue(games_df: pd.DataFrame, days: int) -> pd.Series:
+    """
+    Compute rolling bullpen fatigue: sum of bp_ip_game over the `days` calendar
+    days immediately before each game (current game's IP excluded).
+
+    Returns a Series indexed by (team, season, period) named 'bp_ip_14d'.
+    Returns all-NaN if 'bp_ip_game' is not present in games_df.
+    """
+    idx = pd.MultiIndex.from_frame(games_df[["team", "season", "period"]])
+    if "bp_ip_game" not in games_df.columns:
+        return pd.Series(np.nan, index=idx, name="bp_ip_14d")
+
+    fat = games_df[["team", "season", "date", "period", "bp_ip_game"]].copy()
+    fat["date"] = pd.to_datetime(fat["date"])
+    fat = fat.sort_values(["team", "season", "date"])
+    fat_rows = []
+    for (team, season_val), grp in fat.groupby(["team", "season"]):
+        grp = grp.set_index("date").sort_index()
+        rolling = (
+            grp["bp_ip_game"]
+            .shift(1, freq="D")
+            .rolling(f"{days}D")
+            .sum()
+        )
+        for period, val in zip(grp["period"], rolling.values):
+            fat_rows.append({
+                "team": team, "season": season_val,
+                "period": int(period), "bp_ip_14d": val,
+            })
+    if not fat_rows:
+        return pd.Series(np.nan, index=idx, name="bp_ip_14d")
+    fat_df = pd.DataFrame(fat_rows).set_index(["team", "season", "period"])
+    return fat_df["bp_ip_14d"]
+
+
+def compute_bp_fatigue_for_date(
+    season_games: pd.DataFrame,
+    game_date: str,
+    days: int,
+) -> dict[str, float]:
+    """
+    Compute pre-game bullpen fatigue for an upcoming game on `game_date`.
+
+    Unlike _compute_bp_fatigue (which is indexed by period and only covers
+    games already in the DB), this function uses the actual game date so it
+    works correctly for prediction — the upcoming game has no period entry yet.
+
+    Returns a dict: team -> sum of bp_ip_game over the `days` calendar days
+    strictly before `game_date`.  Teams with no bp_ip_game data return NaN.
+    """
+    if "bp_ip_game" not in season_games.columns:
+        return {}
+
+    cutoff = pd.Timestamp(game_date)
+    window_start = cutoff - pd.Timedelta(days=days)
+
+    fat = season_games[["team", "date", "bp_ip_game"]].copy()
+    fat["date"] = pd.to_datetime(fat["date"])
+    fat = fat.dropna(subset=["bp_ip_game"])
+
+    # Games strictly before game_date and within the rolling window
+    mask = (fat["date"] >= window_start) & (fat["date"] < cutoff)
+    recent = fat[mask]
+
+    if recent.empty:
+        return {}
+
+    return recent.groupby("team")["bp_ip_game"].sum().to_dict()
 
 
 _SS_MEAN_WINDOW  = 5   # fixed rolling window for ss_mean (EDA: 5-8 games optimal)
@@ -665,11 +909,14 @@ def _collect_window(
 
     # --- Context features for the target period ---
     _CTX_COLS = [
-        "home", "is_b2b", "spread",
-        "off_rating", "def_rating", "net_rating",
-        "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge",
-        "sp_era", "sp_whip", "sp_k9",
+        "home", "is_b2b",
+        "sp_era", "sp_whip", "sp_k9", "sp_ip_per_start",
         "opp_sp_era", "opp_sp_whip", "sp_era_edge",
+        "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
+        "bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game",
+        "opp_bp_era", "opp_bp_whip", "bp_era_edge",
+        "ml_implied_prob",
+        "bp_ip_14d",
     ]
     try:
         ctx_slice   = context.xs(target, level="period")
@@ -702,7 +949,7 @@ def _collect_window(
         if col not in _CAT_COLS:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     X_out.append(df)
-    y_out.append(pd.Series(y.values, dtype=float))
+    y_out.append(pd.Series((y.values > 0).astype(int), dtype=float))
 
 
 def build_prediction_features(
@@ -751,14 +998,16 @@ def build_prediction_features(
     X["period"] = next_period
 
     # Join context features for the upcoming game
-    # spread_juice, total, implied_prob re-added once historical odds are backfilled
     # sp_era / sp_whip / sp_k9 / matchup pitcher cols used for MLB
     _CTX_COLS = [
-        "home", "is_b2b", "spread",
-        "off_rating", "def_rating", "net_rating",
-        "opp_off_rating", "opp_def_rating", "matchup_off_edge", "matchup_def_edge",
-        "sp_era", "sp_whip", "sp_k9",
+        "home", "is_b2b",
+        "sp_era", "sp_whip", "sp_k9", "sp_ip_per_start",
         "opp_sp_era", "opp_sp_whip", "sp_era_edge",
+        "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
+        "bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game",
+        "opp_bp_era", "opp_bp_whip", "bp_era_edge",
+        "ml_implied_prob",
+        "bp_ip_14d",
     ]
     if upcoming_context is not None and not upcoming_context.empty:
         for col in _CTX_COLS:
@@ -768,7 +1017,7 @@ def build_prediction_features(
             X[col] = np.nan
 
     # Elo ratings for upcoming game (pre-game, using all completed games this season)
-    elo_df = elo_mod.compute(completed, k=best_k)
+    elo_df = elo_mod.compute(completed, k=best_k, window=_ELO_WINDOW)
     # Get most recent Elo per team (last period before next_period)
     latest_elo = (
         elo_df.reset_index()
@@ -818,25 +1067,28 @@ def _select_hyperparams(
     next_period: int,
     eval_season: int,
     eval_split_period: int,
-) -> tuple[int, float, dict]:
+) -> tuple[int, float, int, dict]:
     """
-    Choose the best (lookback, K) combination via 5-fold CV on training data.
+    Choose the best (lookback, K, bp_fatigue_days) combination via 5-fold CV.
 
-    Searches the Cartesian product of _LOOKBACK_CANDIDATES × _K_CANDIDATES.
-    Scores the regressor (neg MSE) — regression is now the sole model.
-    Falls back to (smallest lookback, K=32) if no candidate yields enough data.
+    Phase 1 — searches _LOOKBACK_CANDIDATES × _K_CANDIDATES (neg MSE).
+    Phase 2 — searches _BP_FATIGUE_CANDIDATES at the winning (lookback, K),
+              swapping only the bp_ip_14d column so the rest of the precomputed
+              feature matrix is reused without recomputation.
 
-    Elo and style embeddings are precomputed once and shared across all
-    candidates — they don't depend on lookback or K (Elo varies with K but
-    not lookback, so one Elo pass per K value suffices).
+    Falls back to (smallest lookback, K=32, 14 days) if no candidate yields
+    enough data.
 
     Returns
     -------
-    best_lookback, best_k, best_elo_ratings, precomp_style
+    best_lookback, best_k, best_bp_days, cache
     """
     print("  Precomputing Elo, style embeddings, and SS pivot...")
     cache = _precompute(games_df, next_period, eval_season, _K_CANDIDATES)
 
+    _xgb_cv = XGBClassifier(**_XGB_FIXED, max_depth=3, n_estimators=100, learning_rate=0.1)
+
+    # ---- Phase 1: lookback × K ----
     best_lb, best_k, best_score = _LOOKBACK_CANDIDATES[0], _K_CANDIDATES[0], -np.inf
     for lb in _LOOKBACK_CANDIDATES:
         for k in _K_CANDIDATES:
@@ -850,12 +1102,13 @@ def _select_hyperparams(
             if len(X_train) < 30:
                 continue
             score = cross_val_score(
-                XGBRegressor(**_XGB_FIXED, max_depth=3, n_estimators=100,
-                             learning_rate=0.1),
-                X_train, y_train, cv=5, scoring="neg_mean_squared_error",
+                _xgb_cv, X_train, y_train,
+                cv=KFold(n_splits=5, shuffle=False),
+                scoring="roc_auc",
             ).mean()
             if score > best_score:
                 best_score, best_lb, best_k = score, lb, k
+    print(f"  Phase 1 -> lookback={best_lb}, K={best_k}")
 
     return best_lb, best_k, cache
 
@@ -865,9 +1118,17 @@ def _tune(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     max_evals: int,
+    seed: int = 42,
 ) -> dict:
-    """Run Hyperopt TPE search; return best params with integer types corrected."""
-    scoring = "f1" if model_class is XGBClassifier else "neg_mean_squared_error"
+    """Run Hyperopt TPE search; return best params with integer types corrected.
+
+    Parameters
+    ----------
+    seed : random seed passed to hyperopt's TPE sampler. Use a fixed value
+           (default 42) for production reproducibility, or vary it across
+           runs to measure true hyperparameter sensitivity.
+    """
+    scoring = "roc_auc" if model_class is XGBClassifier else "neg_mean_squared_error"
 
     def objective(params: dict) -> float:
         p = {
@@ -879,7 +1140,9 @@ def _tune(
             model_class(**p), X_train, y_train, cv=5, scoring=scoring
         ).mean()
 
-    best = fmin(fn=objective, space=_HYPEROPT_SPACE, algo=tpe.suggest, max_evals=max_evals)
+    from hyperopt import Trials
+    best = fmin(fn=objective, space=_HYPEROPT_SPACE, algo=tpe.suggest,
+                max_evals=max_evals, trials=Trials(), rstate=np.random.default_rng(seed))
     return {**best, "max_depth": int(best["max_depth"]),
             "n_estimators": int(best["n_estimators"])}
 
@@ -890,25 +1153,23 @@ def train_models(
     eval_season: int,
     eval_split_period: int,
     max_evals: int = 10,
-) -> tuple[XGBRegressor, float, dict, int, int, emb.StyleModel]:
+    seed: int = 42,
+) -> tuple[XGBClassifier, dict, int, int, int, emb.StyleModel]:
     """
-    Select lookback, tune hyperparameters, and fit the regression model.
+    Select lookback, tune hyperparameters, and fit the binary cover classifier.
 
-    Cover probability is derived from the regression output at inference time
-    via a normal CDF: coverprob = Φ(spread_diff / σ_diff), where spread_diff
-    is the difference between the two teams' predicted SpreadScores and σ_diff
-    is the std of pairwise prediction errors estimated on training residuals.
+    Target: 1 = team covered the run line (spreadscore > 0), 0 = did not cover.
+    The classifier directly outputs P(cover) via predict_proba[:,1], which is
+    used without further transformation to compute EV against the run-line juice.
 
     Returns
     -------
-    reg          : fitted XGBRegressor (predicts SpreadScore per team)
-    sigma_diff   : std of (predspread_A - predspread_B) out-of-sample residuals —
-                   used to convert spread_diff to coverprob via normal CDF
-    scores       : dict of train/test/val evaluation metrics
-    best_lookback: lookback value selected by CV
-    best_k       : Elo K value selected by CV — must be forwarded to
-                   build_prediction_features so Elo features match training scale
-    style_model  : fitted StyleModel for prediction-time style_edge
+    clf           : fitted XGBClassifier (predict_proba[:,1] = P(cover run line))
+    scores        : dict of train/test/val evaluation metrics (ROC-AUC, accuracy)
+    best_lookback : lookback value selected by CV
+    best_k        : Elo K value selected by CV — must be forwarded to
+                    build_prediction_features so Elo features match training scale
+    style_model   : fitted StyleModel for prediction-time style_edge
     """
     print("  Selecting lookback and K...")
     best_lookback, best_k, cache = _select_hyperparams(
@@ -922,51 +1183,144 @@ def train_models(
     )
     print(f"  Rows — train: {len(X_train)}, test: {len(X_test)}, val: {len(X_val)}")
 
-    print("  Tuning regression model...")
-    reg = XGBRegressor(**_XGB_FIXED, **_tune(XGBRegressor, X_train, y_train, max_evals))
-    reg.fit(X_train, y_train)
+    # Feature fill-rate report — warn on any feature that is mostly NaN in training data.
+    # XGBoost handles NaN natively but a feature that is e.g. 30% filled contributes
+    # very little signal and indicates a seeding or name-matching problem.
+    _WARN_FILL  = 0.70
+    _ERROR_FILL = 0.40
+    _KEY_FEATS  = ["sp_era", "sp_era_edge", "bp_era", "bp_era_edge",
+                   "ml_implied_prob", "bp_ip_14d", "elo_diff"]
+    print("  Feature fill rates (training set):")
+    _any_warn = False
+    for _col in _KEY_FEATS:
+        if _col not in X_train.columns:
+            continue
+        _rate = float(X_train[_col].notna().mean())
+        _tag  = "OK   " if _rate >= _WARN_FILL else ("WARN " if _rate >= _ERROR_FILL else "ERROR")
+        if _tag != "OK   ":
+            _any_warn = True
+        print(f"    {_tag}  {_col:22s}: {_rate:5.1%}")
+    if not _any_warn:
+        print("    All key features OK.")
 
-    # Estimate σ_diff from held-out residuals (val > test > train as fallback).
-    # Using out-of-sample residuals avoids the overfitting bias that makes training
-    # residuals ~38% smaller than true generalisation error (R² train≈0.52 vs val≈0.12).
-    # σ_diff = σ_residual · √2  (Var(A-B) = Var(A) + Var(B) for independent predictions).
-    train_resid = y_train.values - reg.predict(X_train)
-    if not X_val.empty:
-        oos_resid = y_val.values - reg.predict(X_val)
-    elif not X_test.empty:
-        oos_resid = y_test.values - reg.predict(X_test)
-    else:
-        oos_resid = train_resid   # last resort — early periods with no eval data
-    sigma_resid = float(np.std(oos_resid))
-    sigma_diff  = sigma_resid * np.sqrt(2)
+    print("  Tuning binary cover classifier...")
+    clf = XGBClassifier(
+        **_XGB_FIXED, random_state=42,
+        **_tune(XGBClassifier, X_train, y_train, max_evals, seed=seed)
+    )
+    clf.fit(X_train, y_train)
 
     # Evaluation metrics
-    train_sign_acc = float((np.sign(reg.predict(X_train)) == np.sign(y_train.values)).mean())
+    from sklearn.metrics import roc_auc_score, accuracy_score
+    train_acc = float(accuracy_score(y_train, clf.predict(X_train)))
+    try:
+        train_roc = float(roc_auc_score(y_train, clf.predict_proba(X_train)[:, 1]))
+    except ValueError:
+        train_roc = float("nan")
 
-    sigma_source = "val" if not X_val.empty else ("test" if not X_test.empty else "train")
     scores = {
-        "lookback":       best_lookback,
-        "elo_k":          best_k,
-        "sigma_source":   sigma_source,
-        "sigma_resid":    round(sigma_resid, 3),
-        "sigma_diff":     round(sigma_diff, 3),
-        "reg_train_r2":   round(reg.score(X_train, y_train), 3),
-        "reg_train_sign": round(train_sign_acc, 3),
-        "reg_test_r2":    round(reg.score(X_test, y_test), 3) if not X_test.empty else None,
+        "lookback":      best_lookback,
+        "elo_k":         best_k,
+        "clf_train_acc": round(train_acc, 3),
+        "clf_train_roc": round(train_roc, 3),
     }
     if not X_test.empty:
-        test_sign_acc = float(
-            (np.sign(reg.predict(X_test)) == np.sign(y_test.values)).mean()
-        )
-        scores["reg_test_sign"] = round(test_sign_acc, 3)
+        try:
+            test_roc = float(roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1]))
+            scores["clf_test_roc"] = round(test_roc, 3)
+            scores["clf_test_acc"] = round(float(accuracy_score(y_test, clf.predict(X_test))), 3)
+        except ValueError:
+            pass
     if not X_val.empty:
-        val_sign_acc = float(
-            (np.sign(reg.predict(X_val)) == np.sign(y_val.values)).mean()
-        )
-        scores["reg_val_r2"]   = round(reg.score(X_val, y_val), 3)
-        scores["reg_val_sign"] = round(val_sign_acc, 3)
+        try:
+            val_roc = float(roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1]))
+            scores["clf_val_roc"] = round(val_roc, 3)
+            scores["clf_val_acc"] = round(float(accuracy_score(y_val, clf.predict(X_val))), 3)
+        except ValueError:
+            pass
 
-    return reg, sigma_diff, scores, best_lookback, best_k, style_model
+    # Refit on all seasons (including eval_season) once hyperparams are locked in.
+    # eval metrics above are computed before this refit so they remain unbiased.
+    all_X_parts = [X_train] + ([X_test] if not X_test.empty else []) + ([X_val] if not X_val.empty else [])
+    all_y_parts = [y_train] + ([y_test] if not X_test.empty else []) + ([y_val] if not X_val.empty else [])
+    clf.fit(pd.concat(all_X_parts, ignore_index=True), pd.concat(all_y_parts, ignore_index=True))
+
+    return clf, scores, best_lookback, best_k, style_model
+
+
+# ---------------------------------------------------------------------------
+# Model persistence
+# ---------------------------------------------------------------------------
+
+import joblib as _joblib
+import datetime as _datetime
+import os as _os
+
+_DEFAULT_MODEL_PATH = _os.path.join(_os.path.dirname(__file__), "data", "mlb_model.pkl")
+
+
+def save_model(
+    clf: XGBClassifier,
+    scores: dict,
+    best_lookback: int,
+    best_k: int | float,
+    style_model,
+    next_period: int | None = None,
+    train_seasons: list | None = None,
+    path: str = _DEFAULT_MODEL_PATH,
+) -> None:
+    """
+    Persist a trained model bundle to disk so analysis scripts can load it
+    without retraining.
+
+    Saves a dict with all artefacts needed to reproduce predictions:
+        clf, scores, best_lookback, best_k, best_bp_days (fixed constant),
+        style_model, next_period, train_seasons, saved_at.
+
+    Usage
+    -----
+        model.save_model(clf, scores, best_lookback, best_k,
+                         style_model, next_period=30)
+        bundle = model.load_model()
+    """
+    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+    bundle = {
+        "clf":           clf,
+        "scores":        scores,
+        "best_lookback": best_lookback,
+        "best_k":        best_k,
+        "best_bp_days":  _BP_FATIGUE_DAYS,   # fixed — not a hyperparameter
+        "style_model":   style_model,
+        "next_period":   next_period,
+        "train_seasons": train_seasons,
+        "saved_at":      _datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    _joblib.dump(bundle, path, compress=3)
+    print(f"  Model saved -> {path}  ({_os.path.getsize(path) // 1024} KB)")
+
+
+def load_model(path: str = _DEFAULT_MODEL_PATH) -> dict:
+    """
+    Load a model bundle saved by save_model().
+
+    Returns a dict with keys:
+        clf, scores, best_lookback, best_k, best_bp_days,
+        style_model, next_period, train_seasons, saved_at.
+
+    Raises FileNotFoundError if no model has been saved yet.
+    """
+    if not _os.path.exists(path):
+        raise FileNotFoundError(
+            f"No saved model found at {path}. "
+            "Run _kelly_analysis.py to train and save the model first."
+        )
+    bundle = _joblib.load(path)
+    age = _datetime.datetime.now() - _datetime.datetime.fromisoformat(bundle["saved_at"])
+    hours = age.total_seconds() / 3600
+    print(f"  Loaded model from {path}  (saved {hours:.1f}h ago, "
+          f"next_period={bundle.get('next_period')}, "
+          f"seasons={bundle.get('train_seasons')})")
+    return bundle
 
 
 # ---------------------------------------------------------------------------
@@ -974,63 +1328,31 @@ def train_models(
 # ---------------------------------------------------------------------------
 
 def predict(
-    reg: XGBRegressor,
-    sigma_diff: float,
+    clf: XGBClassifier,
     X_pred: pd.DataFrame,
-    opponent_map: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """
-    Generate predictions indexed by team.
+    Generate cover-probability predictions indexed by team.
 
-    Steps
-    -----
-    1. Regression model predicts `predspread` per team (kept for inspection).
-    2. For each game pair (A vs B): spread_diff = predspread_A - predspread_B.
-       This cancels systematic bias and enforces P(A) + P(B) = 1.
-    3. coverprob = Φ(spread_diff / sigma_diff) via normal CDF.
+    The classifier directly outputs P(cover the +1.5 run line) for each team.
+    No pairing or normal-CDF transformation is needed — the probability is the
+    model output.
 
     Parameters
     ----------
-    reg          : fitted XGBRegressor
-    sigma_diff   : std of pairwise prediction errors from training (from train_models)
-    X_pred       : feature matrix with a `team` column
-    opponent_map : dict mapping team -> opponent for the upcoming game.
-                   If None, coverprob falls back to Φ(predspread / (sigma_diff/√2)).
+    clf    : fitted XGBClassifier (from train_models / load_model)
+    X_pred : feature matrix with a `team` column (from build_prediction_features)
 
     Returns
     -------
-    DataFrame indexed by team with columns:
-        predspread  : raw regression output (positive = expected to cover)
-        spread_diff : predspread_team - predspread_opponent  (decision signal)
-        coverprob   : Φ(spread_diff / sigma_diff)
+    DataFrame indexed by team with column:
+        coverprob : P(team covers +1.5 run line) = clf.predict_proba[:,1]
     """
-    feat_cols  = reg.get_booster().feature_names
-    predspread = reg.predict(X_pred[feat_cols])
-    teams      = X_pred["team"].values
-
-    pred_series = pd.Series(predspread, index=teams)
-
-    spread_diff = np.full(len(teams), np.nan)
-    # Per-team sigma: paired games use σ_diff; unmatched teams fall back to
-    # σ_diff/√2 (the single-prediction uncertainty, since no opponent subtraction).
-    sigmas = np.full(len(teams), sigma_diff / np.sqrt(2))
-
-    for i, team in enumerate(teams):
-        opp = (opponent_map or {}).get(team)
-        if opp and opp in pred_series.index:
-            spread_diff[i] = pred_series[team] - pred_series[opp]
-            sigmas[i] = sigma_diff          # paired: spread_diff variance = 2·σ²
-        else:
-            spread_diff[i] = pred_series[team]  # single: use raw predspread
-            # sigmas[i] already set to sigma_diff / √2
-
-    coverprob = norm.cdf(spread_diff / sigmas)
+    feat_cols = clf.get_booster().feature_names
+    coverprob = clf.predict_proba(X_pred[feat_cols])[:, 1]
+    teams     = X_pred["team"].values
 
     return pd.DataFrame(
-        {
-            "predspread":  predspread,
-            "spread_diff": spread_diff,
-            "coverprob":   coverprob,
-        },
+        {"coverprob": coverprob},
         index=teams,
     )

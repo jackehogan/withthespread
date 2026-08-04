@@ -123,7 +123,7 @@ MLB = SportConfig(
     api_sports_season_fmt="{year}",
     odds_api_sport="baseball_mlb",
     season_periods=162,
-    eval_season=2023,
+    eval_season=2025,
     eval_split_period=81,          # games 1-80 -> test, 81-162 -> val
     # Opening Day has been as early as March 20 in recent years; World Series
     # can extend to early November but regular season ends late September.

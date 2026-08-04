@@ -9,14 +9,16 @@ games
     Upserted on every pipeline run — safe to re-run without duplicates.
 
 predictions
-    One document per (sport, team, season, period).
-    Stores model outputs for an upcoming period.
-    Also upserted — re-running overwrites stale predictions cleanly.
+    One document per (sport, team, season, prediction_date).
+    Stores model outputs for a specific game date. prediction_date is included
+    in the key so each nightly run creates independent records — teams with the
+    same next_period across consecutive days do not overwrite each other.
+    `period` is stored as a data field (used to look up game results).
 
 Indexes (create once via create_indexes())
 ------------------------------------------
     games:       unique on (sport, team, season, period)
-    predictions: unique on (sport, team, season, period)
+    predictions: unique on (sport, team, season, prediction_date)
 """
 
 import json
@@ -25,8 +27,9 @@ import pandas as pd
 from pymongo import ASCENDING, MongoClient, UpdateOne
 from pymongo.collection import Collection
 
-_MONGO_DB = "withTheSpread"
-_KEY = ("sport", "team", "season", "period")
+_MONGO_DB   = "withTheSpread"
+_KEY        = ("sport", "team", "season", "period")           # games key
+_PRED_KEY   = ("sport", "team", "season", "prediction_date")  # predictions key
 
 
 def _read_config(path: str = "data/config.txt") -> dict:
@@ -48,12 +51,19 @@ def connect(config_path: str = "data/config.txt") -> MongoClient:
 
 def create_indexes(client: MongoClient) -> None:
     """Create unique compound indexes on both collections. Idempotent."""
-    for col_name in ("games", "predictions"):
-        client[_MONGO_DB][col_name].create_index(
-            [(k, ASCENDING) for k in _KEY],
-            unique=True,
-            name="sport_team_season_period",
-        )
+    client[_MONGO_DB]["games"].create_index(
+        [(k, ASCENDING) for k in _KEY],
+        unique=True,
+        name="sport_team_season_period",
+    )
+    # Predictions are keyed by prediction_date (not period) so each nightly
+    # run produces independent records even when next_period is the same
+    # across consecutive days.
+    client[_MONGO_DB]["predictions"].create_index(
+        [(k, ASCENDING) for k in _PRED_KEY],
+        unique=True,
+        name="sport_team_season_prediction_date",
+    )
     print("Indexes created (or already exist).")
 
 
@@ -89,24 +99,166 @@ def fetch_predictions(
 # Write
 # ---------------------------------------------------------------------------
 
-def _upsert(collection: Collection, records: list[dict]) -> None:
+def _upsert(collection: Collection, records: list[dict], key_fields: tuple) -> None:
     if not records:
         return
-    ops = [
-        UpdateOne({k: r[k] for k in _KEY}, {"$set": r}, upsert=True)
-        for r in records
-    ]
+    ops = []
+    for r in records:
+        key = {k: r[k] for k in key_fields}
+        # Only $set fields that have a real value — never overwrite existing data with None.
+        payload = {k: v for k, v in r.items() if v is not None and v == v}  # v==v excludes NaN
+        ops.append(UpdateOne(key, {"$set": payload}, upsert=True))
     collection.bulk_write(ops)
 
 
 def upsert_games(client: MongoClient, records: list[dict]) -> None:
-    """Upsert game records. Each record must contain all four key fields."""
-    _upsert(client[_MONGO_DB]["games"], records)
+    """Upsert game records. Keyed on (sport, team, season, period)."""
+    _upsert(client[_MONGO_DB]["games"], records, _KEY)
 
 
 def upsert_predictions(client: MongoClient, records: list[dict]) -> None:
-    """Upsert prediction records. Each record must contain all four key fields."""
-    _upsert(client[_MONGO_DB]["predictions"], records)
+    """Upsert prediction records. Keyed on (sport, team, season, prediction_date).
+
+    Each nightly run stores independent records — teams with the same next_period
+    on consecutive days will no longer overwrite each other's predictions.
+    All records must include a 'prediction_date' field (YYYY-MM-DD string).
+    """
+    _upsert(client[_MONGO_DB]["predictions"], records, _PRED_KEY)
+
+
+def update_prediction_results(
+    client: MongoClient,
+    sport: str,
+    season: int,
+) -> int:
+    """
+    Match completed game results to pending predictions and compute P&L.
+
+    For each prediction without a 'covered' field, looks up the corresponding
+    game document. If a spreadscore exists (game is complete), computes:
+
+        covered   : True if spreadscore > 0, False if < 0, None if push (= 0)
+        pnl       : profit/loss for a 1-unit flat bet, using stored run-line
+                    juice (moneyline field). Falls back to -110 if missing.
+                      win  : 100 / abs(juice) if juice < 0
+                             juice / 100      if juice > 0
+                      lose : -1.0
+                      push : 0.0
+        result_spreadscore : the actual spreadscore from the game document
+
+    Safe to call repeatedly — only updates documents still missing 'covered'.
+
+    Returns the number of predictions updated.
+    """
+    pred_col = client[_MONGO_DB]["predictions"]
+    game_col = client[_MONGO_DB]["games"]
+
+    # Only resolve predictions where EV was positive at prediction time.
+    # Fetch prediction_date so we can use it as the update key.
+    pending = list(pred_col.find(
+        {"sport": sport, "season": season, "covered": {"$exists": False}, "ev": {"$gt": 0}},
+        {"_id": 0, "team": 1, "period": 1, "prediction_date": 1,
+         "moneyline": 1, "ml_odds": 1, "spread": 1, "ev": 1, "bet": 1},
+    ))
+    if not pending:
+        return 0
+
+    ops = []
+    for pred in pending:
+        game = game_col.find_one(
+            {"sport": sport, "team": pred["team"],
+             "season": season, "period": pred["period"]},
+            {"spreadscore": 1, "_id": 0},
+        )
+        if not game or game.get("spreadscore") is None:
+            continue  # game not yet complete
+
+        ss = float(game["spreadscore"])
+
+        # Covered / push / loss
+        if ss > 0:
+            covered = True
+        elif ss < 0:
+            covered = False
+        else:
+            covered = None  # push
+
+        # P&L for 1-unit flat bet — use the odds for whichever market was bet
+        bet = pred.get("bet", "SPREAD")
+        raw_juice = pred.get("ml_odds") if bet == "ML" else pred.get("moneyline")
+        try:
+            juice = float(raw_juice) if raw_juice is not None else -110.0
+        except (TypeError, ValueError):
+            juice = -110.0
+
+        if covered is None:
+            pnl = 0.0
+        elif covered:
+            pnl = (100.0 / abs(juice)) if juice < 0 else (juice / 100.0)
+        else:
+            pnl = -1.0
+
+        # Match on (sport, team, season, prediction_date) — the prediction key.
+        # Fall back to period-based match for legacy records without prediction_date.
+        pred_date = pred.get("prediction_date")
+        if pred_date:
+            match_filter = {"sport": sport, "team": pred["team"],
+                            "season": season, "prediction_date": pred_date}
+        else:
+            match_filter = {"sport": sport, "team": pred["team"],
+                            "season": season, "period": pred["period"]}
+
+        ops.append(UpdateOne(
+            match_filter,
+            {"$set": {
+                "covered":            covered,
+                "pnl":                round(pnl, 4),
+                "result_spreadscore": ss,
+            }},
+            upsert=False,
+        ))
+
+    if not ops:
+        return 0
+    result = pred_col.bulk_write(ops)
+    return result.modified_count
+
+
+def fetch_roi_summary(
+    client: MongoClient,
+    sport: str,
+    season: int | None = None,
+) -> dict:
+    """
+    Return a P&L summary for all resolved predictions.
+
+    Keys: n_bets, wins, losses, pushes, win_rate, total_pnl, roi_pct
+    """
+    query: dict = {"sport": sport, "covered": {"$exists": True}, "ev": {"$gt": 0}}
+    if season is not None:
+        query["season"] = season
+
+    docs = list(client[_MONGO_DB]["predictions"].find(query, {"covered": 1, "pnl": 1, "_id": 0}))
+    if not docs:
+        return {"n_bets": 0, "wins": 0, "losses": 0, "pushes": 0,
+                "win_rate": None, "total_pnl": 0.0, "roi_pct": None}
+
+    wins   = sum(1 for d in docs if d.get("covered") is True)
+    losses = sum(1 for d in docs if d.get("covered") is False)
+    pushes = sum(1 for d in docs if d.get("covered") is None)
+    pnl    = sum(d.get("pnl", 0.0) or 0.0 for d in docs)
+    n_bets = wins + losses + pushes
+    decisive = wins + losses  # exclude pushes from rate
+
+    return {
+        "n_bets":    n_bets,
+        "wins":      wins,
+        "losses":    losses,
+        "pushes":    pushes,
+        "win_rate":  round(wins / decisive, 4) if decisive else None,
+        "total_pnl": round(pnl, 4),
+        "roi_pct":   round(100 * pnl / n_bets, 2) if n_bets else None,
+    }
 
 
 def upsert_game_ratings(
