@@ -1,0 +1,11 @@
+xgboost==3.0.4
+pymongo[srv]==4.14.1
+pandas==2.3.2
+numpy==2.0.1
+MLB-StatsAPI==1.9.0
+hyperopt==0.2.7
+scikit-learn==1.7.1
+shap==0.49.1
+requests==2.32.3
+scipy==1.15.3
+dnspython==2.7.0

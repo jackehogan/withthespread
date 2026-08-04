@@ -1,0 +1,43 @@
+name: MLB Nightly Predictions
+
+on:
+  schedule:
+    - cron: '0 14 * * *'  # 10:00 AM EDT (14:00 UTC)
+  workflow_dispatch:        # manual trigger from GitHub Actions tab
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write config
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          mkdir -p data
+          python -c "import os; open('data/config.txt', 'w').write(os.environ['CONFIG_JSON'])"
+
+      - name: Seed recent data
+        run: |
+          YEAR=$(date +%Y)
+          YESTERDAY=$(date -d yesterday +%Y-%m-%d)
+          python seed_mlb.py --seasons $YEAR --since $YESTERDAY
+
+      - name: Train model
+        run: python train_mlb.py --evals 50
+
+      - name: Generate predictions
+        run: python predict_mlb.py --days-ahead 0
