@@ -2,7 +2,7 @@ name: MLB Nightly Predictions
 
 on:
   schedule:
-    - cron: '0 14 * * *'  # 10:00 AM EDT (14:00 UTC)
+    - cron: '0 9 * * *'   # 5:00 AM EDT (09:00 UTC)
   workflow_dispatch:        # manual trigger from GitHub Actions tab
 
 jobs:
