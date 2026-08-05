@@ -26,8 +26,10 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import smtplib
 import time
+from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -119,9 +121,11 @@ def send_predictions_email(
             top_reason = "&#8212;"
         else:
             top_reason = str(reasons_raw).split(",")[0].strip()
+        game_time = row.get("game_time") or "&#8212;"
         highlight = ' style="background:#e8f5e9;"' if pd.notna(ev) and ev > 0 else ""
         rows_html.append(
             f"<tr{highlight}>"
+            f"<td style='white-space:nowrap'>{game_time}</td>"
             f"<td>{matchup}</td><td><b>{bet_str}</b></td>"
             f"<td>{ev_str}</td><td>{juice_str}</td>"
             f"<td>{cover_str}</td><td style='font-weight:bold'>{bet_amt_str}</td>"
@@ -132,8 +136,8 @@ def send_predictions_email(
 
     table_html = (
         "<table class='picks'>"
-        "<tr><th>Matchup</th><th>Bet</th><th>EV</th><th>Line</th><th>Prob%</th>"
-        "<th>Bet ($100 BR)</th><th>Pitcher</th><th>Top Reason</th></tr>"
+        "<tr><th>Time</th><th>Matchup</th><th>Bet</th><th>EV</th><th>Line</th>"
+        "<th>Prob%</th><th>Bet ($100 BR)</th><th>Pitcher</th><th>Top Reason</th></tr>"
         + "".join(rows_html)
         + "</table>"
     )
@@ -240,6 +244,8 @@ def fetch_upcoming_mlb_games(target_date: str) -> pd.DataFrame:
             "away_team": away,
             "home_sp":   game.get("home_probable_pitcher", "") or "",
             "away_sp":   game.get("away_probable_pitcher", "") or "",
+            # UTC ISO; rendered in Eastern for display.
+            "game_datetime": game.get("game_datetime", "") or "",
         })
 
     if not rows:
@@ -253,6 +259,21 @@ def fetch_upcoming_mlb_games(target_date: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Upcoming context assembly
 # ---------------------------------------------------------------------------
+
+def _et_time(iso_utc: str) -> str:
+    """Render a UTC ISO timestamp as Eastern clock time, e.g. '7:05 PM ET'."""
+    if not iso_utc:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso_utc).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    local = dt.astimezone(ZoneInfo("America/New_York"))
+    return local.strftime("%-I:%M %p ET") if os.name != "nt" \
+        else local.strftime("%I:%M %p ET").lstrip("0")
+
 
 def _american_to_raw_prob(ml_val) -> float:
     """American odds → raw implied probability (includes vig)."""
@@ -305,6 +326,7 @@ def build_upcoming_context_mlb(
 
     for _, game in schedule_df.iterrows():
         game_date  = game["game_date"]
+        game_time  = _et_time(game.get("game_datetime", ""))
         game_num   = int(game.get("game_num", 1))
         home_team  = game["home_team"]
         away_team  = game["away_team"]
@@ -357,6 +379,7 @@ def build_upcoming_context_mlb(
                 "matchup":     matchup_str,
                 "game_num":    game_num,
                 "game_date":   game_date,
+                "game_time":   game_time,
                 "home":        float(is_home),
                 "is_b2b":      is_b2b,
                 "spread":      spread,
@@ -823,7 +846,8 @@ def _run(
     preds = ml.predict(clf, X_pred, win_clf=_bundle.get("win_clf"))
 
     # Attach context columns for display
-    display_cols = ["opponent", "matchup", "game_num", "home", "spread", "moneyline", "ml_odds", "ml_implied_prob", "sp_name"]
+    display_cols = ["opponent", "matchup", "game_num", "game_time", "home", "spread",
+                    "moneyline", "ml_odds", "ml_implied_prob", "sp_name"]
     if not upcoming_context.empty:
         for col in display_cols:
             if col in upcoming_context.columns:
@@ -1074,7 +1098,7 @@ if __name__ == "__main__":
         print("\n" + "=" * 68)
         print(f"  MLB PREDICTIONS -- {target}")
         print("=" * 68)
-        print(f"  {'Matchup':<18} {'Bet':<12} {'EV':>6} {'Line':>6} {'Prob%':>7}  Pitcher")
+        print(f"  {'Time':<10} {'Matchup':<18} {'Bet':<12} {'EV':>6} {'Line':>6} {'Prob%':>7}  Pitcher")
         print("-" * 68)
         for team, row in result.iterrows():
             ev = row.get("ev", float("nan"))
@@ -1093,4 +1117,5 @@ if __name__ == "__main__":
             sp_parts = sp.split() if sp else []
             sp_abbr = (f"{sp_parts[0][0]}.{' '.join(sp_parts[1:])}" if len(sp_parts) > 1 else sp)[:14]
             marker = " *" if pd.notna(ev) and ev > 0 else ""
-            print(f"  {matchup:<18} {bet_str:<12} {ev_str:>6} {juice_str:>6} {cover_str:>7}  {sp_abbr}{marker}")
+            gt = (row.get("game_time") or "")[:10]
+            print(f"  {gt:<10} {matchup:<18} {bet_str:<12} {ev_str:>6} {juice_str:>6} {cover_str:>7}  {sp_abbr}{marker}")
