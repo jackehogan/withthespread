@@ -821,7 +821,7 @@ def _run(
         print("  Not enough season data to generate predictions.")
         return pd.DataFrame()
 
-    preds = ml.predict(clf, X_pred)
+    preds = ml.predict(clf, X_pred, win_clf=_bundle.get("win_clf"))
 
     # Attach context columns for display
     display_cols = ["opponent", "matchup", "game_num", "home", "spread", "moneyline", "ml_odds", "ml_implied_prob", "sp_name"]
@@ -855,12 +855,42 @@ def _run(
         except (TypeError, ValueError):
             return np.nan
 
-    # EV: coverprob (from classifier) vs run-line juice
-    preds["ev"] = preds.apply(
+    # Price each market against its own probability and its own odds, then take
+    # whichever is better.
+    #   SPREAD : coverprob vs the run-line juice
+    #   ML     : win_prob  vs the head-to-head moneyline
+    # These were previously conflated — cover probability was priced against
+    # whatever sat in `moneyline`, which for ESPN-seeded rows was the h2h price.
+    preds["ev_spread"] = preds.apply(
         lambda r: _calc_ev(float(r["coverprob"]), float(r.get("moneyline", np.nan))),
         axis=1,
     )
-    preds["bet"] = "SPREAD"
+    preds["ev_ml"] = preds.apply(
+        lambda r: _calc_ev(float(r.get("win_prob", np.nan)),
+                           float(r.get("ml_odds", np.nan))),
+        axis=1,
+    )
+
+    # Selecting max(ev_spread, ev_ml) is a selection procedure: with two noisy
+    # estimates the maximum is biased upward, so a bet chosen this way needs a
+    # higher bar than a single-market bet would. _EV_SELECTION_PENALTY is
+    # subtracted from the loser-of-two before comparing, and downstream min_ev
+    # thresholds should be set with this bias in mind.
+    _EV_SELECTION_PENALTY = 0.0   # tune once there is enough resolved history
+
+    def _pick(row):
+        s, m = row["ev_spread"], row["ev_ml"]
+        if pd.isna(m) and pd.isna(s):
+            return pd.Series({"bet": "SPREAD", "ev": np.nan})
+        if pd.isna(m):
+            return pd.Series({"bet": "SPREAD", "ev": s})
+        if pd.isna(s):
+            return pd.Series({"bet": "ML", "ev": m})
+        if m - _EV_SELECTION_PENALTY > s:
+            return pd.Series({"bet": "ML", "ev": m})
+        return pd.Series({"bet": "SPREAD", "ev": s})
+
+    preds[["bet", "ev"]] = preds.apply(_pick, axis=1)
 
     # Drop teams with no game scheduled today (no opponent in context)
     preds = preds[preds["opponent"].notna()]
@@ -895,9 +925,13 @@ def _run(
             "ml_implied_prob": float(row["ml_implied_prob"]) if pd.notna(row.get("ml_implied_prob")) else None,
             "sp_name":         row.get("sp_name") or None,
             "coverprob":       float(row["coverprob"]),
+            "win_prob":        float(row["win_prob"])  if pd.notna(row.get("win_prob"))        else None,
             "coverprob_diff":  row["coverprob_diff"]  if pd.notna(row.get("coverprob_diff"))  else None,
             "edge":            float(row["edge"])      if pd.notna(row.get("edge"))            else None,
             "ev":              float(row["ev"])        if pd.notna(row.get("ev"))              else None,
+            "ev_spread":       float(row["ev_spread"]) if pd.notna(row.get("ev_spread"))       else None,
+            "ev_ml":           float(row["ev_ml"])     if pd.notna(row.get("ev_ml"))           else None,
+            "bet":             row.get("bet"),
             "ml_odds":         float(row["ml_odds"])   if pd.notna(row.get("ml_odds"))         else None,
             "reasons":         row.get("reasons") or None,
             "prediction_date": target_date,

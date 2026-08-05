@@ -86,6 +86,33 @@ _HYPEROPT_SPACE = {
 # Feature engineering
 # ---------------------------------------------------------------------------
 
+def _cover_and_win_labels(ss_vals, ctx_aligned) -> tuple[pd.Series, pd.Series]:
+    """
+    Derive both prediction targets from the same rows.
+
+        cover = spreadscore > 0
+        win   = diff > 0, and diff = spreadscore - spread
+
+    No extra pivot is needed: raw spreadscore is still in hand at this point
+    and `spread` comes from the context already fetched for the feature matrix.
+
+    Win is NaN wherever spread is missing, since diff cannot be recovered
+    there. Those rows are dropped when fitting the win model but still train
+    the cover model, so neither target loses rows unnecessarily.
+    """
+    ss = np.asarray(ss_vals, dtype=float)
+    cover = pd.Series((ss > 0).astype(float), dtype=float)
+
+    if ctx_aligned is not None and "spread" in ctx_aligned.columns:
+        spread = pd.to_numeric(ctx_aligned["spread"], errors="coerce").values
+        diff = ss - spread
+        win = pd.Series(np.where(np.isnan(diff), np.nan, (diff > 0).astype(float)),
+                        dtype=float)
+    else:
+        win = pd.Series(np.full(len(ss), np.nan), dtype=float)
+    return cover, win
+
+
 def _precompute(
     games_df: pd.DataFrame,
     next_period: int,
@@ -237,9 +264,11 @@ def _precompute(
                 base   = _compute_ss_features(train_ss, common, target).reset_index(drop=True)
                 base["period"] = target
                 ctx_grp = train_ctx_by_p.get(target)
+                _ctx_al = ctx_grp.reindex(common) if ctx_grp is not None else None
                 for col in _CTX:
-                    base[col] = ctx_grp.reindex(common)[col].values if (ctx_grp is not None and col in ctx_grp.columns) else np.nan
+                    base[col] = _ctx_al[col].values if (_ctx_al is not None and col in _ctx_al.columns) else np.nan
                 # style_edge deliberately omitted — see _USE_STYLE_EDGE.
+                y_cov_tr, y_win_tr = _cover_and_win_labels(y_tr, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
                     df_k["elo_diff"], df_k["opponent_elo"] = _add_elo(base, common, train_elo_by_k_p[k], target)
@@ -247,7 +276,7 @@ def _precompute(
                     for col in df_k.columns:
                         if col not in _CAT_COLS:
                             df_k[col] = pd.to_numeric(df_k[col], errors="coerce")
-                    train_feats_by_k_target[k][target] = (df_k, pd.Series((y_tr.values > 0).astype(int), dtype=float), common)
+                    train_feats_by_k_target[k][target] = (df_k, y_cov_tr, y_win_tr, common)
 
         # --- eval split ---
         if target in eval_ss.columns:
@@ -261,9 +290,11 @@ def _precompute(
                 base   = _compute_ss_features(eval_ss, common, target).reset_index(drop=True)
                 base["period"] = target
                 ctx_grp = eval_ctx_by_p.get(target)
+                _ctx_al = ctx_grp.reindex(common) if ctx_grp is not None else None
                 for col in _CTX:
-                    base[col] = ctx_grp.reindex(common)[col].values if (ctx_grp is not None and col in ctx_grp.columns) else np.nan
+                    base[col] = _ctx_al[col].values if (_ctx_al is not None and col in _ctx_al.columns) else np.nan
                 # style_edge deliberately omitted — see _USE_STYLE_EDGE.
+                y_cov_ev, y_win_ev = _cover_and_win_labels(y_ev, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
                     df_k["elo_diff"], df_k["opponent_elo"] = _add_elo(base, common, eval_elo_by_k_p[k], target)
@@ -271,7 +302,7 @@ def _precompute(
                     for col in df_k.columns:
                         if col not in _CAT_COLS:
                             df_k[col] = pd.to_numeric(df_k[col], errors="coerce")
-                    eval_feats_by_k_target[k][target] = (df_k, pd.Series((y_ev.values > 0).astype(int), dtype=float), common)
+                    eval_feats_by_k_target[k][target] = (df_k, y_cov_ev, y_win_ev, common)
 
     return {
         "elo_by_k":                elo_by_k,
@@ -328,24 +359,27 @@ def build_features(
         eval_n_prior  = _cache["eval_n_prior_by_target"]
         style_model   = _cache["style_model"]
 
-        X_train_parts, y_train_parts = [], []
-        X_test_parts,  y_test_parts  = [], []
-        X_val_parts,   y_val_parts   = [], []
+        X_train_parts, y_train_parts, w_train_parts = [], [], []
+        X_test_parts,  y_test_parts,  w_test_parts  = [], [], []
+        X_val_parts,   y_val_parts,   w_val_parts   = [], [], []
 
         for start in range(1, next_period - lookback + 1):
             target = start + lookback
             if target in train_feats and train_n_prior.get(target, 0) >= lookback:
-                df, y, _ = train_feats[target]
+                df, y, w, _ = train_feats[target]
                 X_train_parts.append(df)
                 y_train_parts.append(y)
+                w_train_parts.append(w)
             if target in eval_feats and eval_n_prior.get(target, 0) >= lookback:
-                df, y, _ = eval_feats[target]
+                df, y, w, _ = eval_feats[target]
                 if target < eval_split_period:
                     X_test_parts.append(df)
                     y_test_parts.append(y)
+                    w_test_parts.append(w)
                 else:
                     X_val_parts.append(df)
                     y_val_parts.append(y)
+                    w_val_parts.append(w)
 
         if not X_train_parts:
             raise ValueError(
@@ -361,7 +395,18 @@ def build_features(
         X_train, y_train = _concat(X_train_parts, y_train_parts)
         X_test,  y_test  = _concat(X_test_parts,  y_test_parts)  if X_test_parts  else (pd.DataFrame(columns=X_train.columns), pd.Series(dtype=float))
         X_val,   y_val   = _concat(X_val_parts,   y_val_parts)   if X_val_parts   else (pd.DataFrame(columns=X_train.columns), pd.Series(dtype=float))
-        return X_train, X_test, y_train, y_test, X_val, y_val, style_model
+
+        # Win labels ride alongside as an 8th return value so existing callers
+        # that unpack seven items keep working.
+        def _cat_y(parts):
+            return (pd.concat(parts, ignore_index=True).astype(float)
+                    if parts else pd.Series(dtype=float))
+        win_labels = {
+            "train": _cat_y(w_train_parts),
+            "test":  _cat_y(w_test_parts),
+            "val":   _cat_y(w_val_parts),
+        }
+        return X_train, X_test, y_train, y_test, X_val, y_val, style_model, win_labels
 
     if _cache is not None:
         # Fallback cache path (no precomputed features — unpack splits, run window loop).
@@ -471,7 +516,14 @@ def build_features(
         X_val = pd.DataFrame(columns=X_train.columns)
         y_val = pd.Series(dtype=float)
 
-    return X_train, X_test, y_train, y_test, X_val, y_val, style_model
+    # Slow path: _collect_window does not derive win labels, so the win model
+    # is unavailable here. Returned empty for a consistent signature; callers
+    # skip win training when these are empty. In practice _precompute always
+    # populates the fast path above.
+    _empty_win = {"train": pd.Series(dtype=float),
+                  "test":  pd.Series(dtype=float),
+                  "val":   pd.Series(dtype=float)}
+    return X_train, X_test, y_train, y_test, X_val, y_val, style_model, _empty_win
 
 
 def _recast_categoricals(df: pd.DataFrame) -> None:
@@ -1190,7 +1242,7 @@ def train_models(
     )
     print(f"  Best lookback: {best_lookback}  Best K: {best_k}")
 
-    X_train, X_test, y_train, y_test, X_val, y_val, style_model = build_features(
+    X_train, X_test, y_train, y_test, X_val, y_val, style_model, win_labels = build_features(
         games_df, next_period, best_lookback, eval_season, eval_split_period,
         best_k=best_k, _cache=cache,
     )
@@ -1252,13 +1304,58 @@ def train_models(
         except ValueError:
             pass
 
+    # --- Second target: P(win outright), for the moneyline market ---
+    # Same features, different label. Trained on the rows where a win label
+    # could be derived (spread present), reusing the cover model's tuned
+    # hyperparameters rather than paying for a second hyperopt run.
+    win_clf = None
+    w_train = win_labels.get("train", pd.Series(dtype=float))
+    if len(w_train) == len(X_train) and w_train.notna().any():
+        _m = w_train.notna().values
+        print(f"  Fitting win classifier on {int(_m.sum())}/{len(X_train)} rows "
+              f"with a derivable win label...")
+        # get_xgb_params() already carries random_state and the fixed settings,
+        # so merge rather than splatting both and colliding on duplicate keys.
+        _win_params = dict(clf.get_xgb_params())
+        _win_params.update(_XGB_FIXED)
+        _win_params["random_state"] = 42
+        win_clf = XGBClassifier(**_win_params)
+        win_clf.fit(X_train[_m], w_train[_m])
+
+        for split, X_s, w_s in (("test", X_test, win_labels.get("test")),
+                                ("val", X_val, win_labels.get("val"))):
+            if X_s.empty or w_s is None or len(w_s) != len(X_s):
+                continue
+            m = w_s.notna().values
+            if m.sum() < 50:
+                continue
+            try:
+                scores[f"win_{split}_roc"] = round(float(
+                    roc_auc_score(w_s[m], win_clf.predict_proba(X_s[m])[:, 1])), 3)
+                scores[f"win_{split}_acc"] = round(float(
+                    accuracy_score(w_s[m], win_clf.predict(X_s[m]))), 3)
+            except ValueError:
+                pass
+    else:
+        print("  No win labels available — skipping win classifier.")
+
     # Refit on all seasons (including eval_season) once hyperparams are locked in.
     # eval metrics above are computed before this refit so they remain unbiased.
     all_X_parts = [X_train] + ([X_test] if not X_test.empty else []) + ([X_val] if not X_val.empty else [])
     all_y_parts = [y_train] + ([y_test] if not X_test.empty else []) + ([y_val] if not X_val.empty else [])
-    clf.fit(pd.concat(all_X_parts, ignore_index=True), pd.concat(all_y_parts, ignore_index=True))
+    _all_X = pd.concat(all_X_parts, ignore_index=True)
+    clf.fit(_all_X, pd.concat(all_y_parts, ignore_index=True))
 
-    return clf, scores, best_lookback, best_k, style_model
+    if win_clf is not None:
+        all_w_parts = [win_labels["train"]] \
+            + ([win_labels["test"]] if not X_test.empty else []) \
+            + ([win_labels["val"]] if not X_val.empty else [])
+        _all_w = pd.concat(all_w_parts, ignore_index=True)
+        if len(_all_w) == len(_all_X):
+            _m = _all_w.notna().values
+            win_clf.fit(_all_X[_m], _all_w[_m])
+
+    return clf, scores, best_lookback, best_k, style_model, win_clf
 
 
 # ---------------------------------------------------------------------------
@@ -1281,6 +1378,7 @@ def save_model(
     next_period: int | None = None,
     train_seasons: list | None = None,
     path: str = _DEFAULT_MODEL_PATH,
+    win_clf: "XGBClassifier | None" = None,
 ) -> None:
     """
     Persist a trained model bundle to disk so analysis scripts can load it
@@ -1299,6 +1397,10 @@ def save_model(
     _os.makedirs(_os.path.dirname(path), exist_ok=True)
     bundle = {
         "clf":           clf,
+        # Second model on the same features predicting P(win outright), used to
+        # price the moneyline. None in bundles saved before this existed, so
+        # callers must handle its absence.
+        "win_clf":       win_clf,
         "scores":        scores,
         "best_lookback": best_lookback,
         "best_k":        best_k,
@@ -1343,29 +1445,37 @@ def load_model(path: str = _DEFAULT_MODEL_PATH) -> dict:
 def predict(
     clf: XGBClassifier,
     X_pred: pd.DataFrame,
+    win_clf: "XGBClassifier | None" = None,
 ) -> pd.DataFrame:
     """
-    Generate cover-probability predictions indexed by team.
+    Generate probabilities for both markets, indexed by team.
 
-    The classifier directly outputs P(cover the +1.5 run line) for each team.
-    No pairing or normal-CDF transformation is needed — the probability is the
-    model output.
+    Each classifier outputs its probability directly — no pairing or normal-CDF
+    transformation is needed.
 
     Parameters
     ----------
-    clf    : fitted XGBClassifier (from train_models / load_model)
-    X_pred : feature matrix with a `team` column (from build_prediction_features)
+    clf     : fitted cover classifier (from train_models / load_model)
+    X_pred  : feature matrix with a `team` column (from build_prediction_features)
+    win_clf : optional win classifier. Absent in bundles saved before the
+              dual-target change, in which case win_prob is NaN and callers
+              fall back to spread-only betting.
 
     Returns
     -------
-    DataFrame indexed by team with column:
-        coverprob : P(team covers +1.5 run line) = clf.predict_proba[:,1]
+    DataFrame indexed by team with columns:
+        coverprob : P(team covers the run line)
+        win_prob  : P(team wins outright), or NaN if no win model
     """
     feat_cols = clf.get_booster().feature_names
     coverprob = clf.predict_proba(X_pred[feat_cols])[:, 1]
     teams     = X_pred["team"].values
 
-    return pd.DataFrame(
-        {"coverprob": coverprob},
-        index=teams,
-    )
+    out = pd.DataFrame({"coverprob": coverprob}, index=teams)
+
+    if win_clf is not None:
+        win_cols = win_clf.get_booster().feature_names
+        out["win_prob"] = win_clf.predict_proba(X_pred[win_cols])[:, 1]
+    else:
+        out["win_prob"] = np.nan
+    return out

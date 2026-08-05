@@ -54,14 +54,14 @@ print(f"  Training seasons: {train_seasons}  |  Tune season: {EVAL_SEASON}")
 print(f"  Rows: {len(games_phase1)}")
 
 # ── Train ─────────────────────────────────────────────────────────────────────
-clf, scores, best_lookback, best_k, style_model = ml.train_models(
+clf, scores, best_lookback, best_k, style_model, win_clf = ml.train_models(
     games_phase1, NEXT_PERIOD, EVAL_SEASON, SPLIT_PERIOD, max_evals=args.evals,
 )
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 ml.save_model(
     clf, scores, best_lookback, best_k, style_model,
-    next_period=NEXT_PERIOD, train_seasons=train_seasons,
+    next_period=NEXT_PERIOD, train_seasons=train_seasons, win_clf=win_clf,
 )
 
 print(f"\nDone.")
