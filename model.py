@@ -86,6 +86,34 @@ _HYPEROPT_SPACE = {
 # Feature engineering
 # ---------------------------------------------------------------------------
 
+_ATS_ELO_WINDOW = 40   # wider than standard Elo: spreadscore is the noisier signal
+
+
+def _attach_ats_elo(elo_df: pd.DataFrame, games_df: pd.DataFrame,
+                    k: float) -> pd.DataFrame:
+    """
+    Add ats_elo_diff / ats_opp_elo alongside the standard Elo columns.
+
+    Same rating machinery, driven by spreadscore instead of run differential,
+    so it rates COVERING rather than winning. Returns the frame unchanged if
+    spreadscore is unavailable.
+    """
+    if "spreadscore" not in games_df.columns:
+        elo_df["ats_elo_diff"] = np.nan
+        elo_df["ats_opp_elo"] = np.nan
+        return elo_df
+    sub = games_df.dropna(subset=["spreadscore"])
+    if sub.empty:
+        elo_df["ats_elo_diff"] = np.nan
+        elo_df["ats_opp_elo"] = np.nan
+        return elo_df
+    ats = elo_mod.compute(sub, k=k, window=_ATS_ELO_WINDOW,
+                          value_col="spreadscore")
+    elo_df["ats_elo_diff"] = ats["elo_diff"].reindex(elo_df.index)
+    elo_df["ats_opp_elo"]  = ats["opp_elo"].reindex(elo_df.index)
+    return elo_df
+
+
 def _cover_and_win_labels(ss_vals, ctx_aligned) -> tuple[pd.Series, pd.Series]:
     """
     Derive both prediction targets from the same rows.
@@ -149,11 +177,17 @@ def _precompute(
     eval_ctx  = context[context.index.get_level_values("season") == eval_season]
 
     # --- Elo: one pass per K value, split into train/eval immediately ---
+    # Two ratings are computed. Standard Elo rates who WINS; ATS Elo runs the
+    # same machinery on spreadscore and rates who COVERS. Measured on 2025,
+    # each is better at its own target (standard .5766 vs win, .5483 vs cover;
+    # ATS .5544 vs win, .5645 vs cover) and they carry independent information.
+    # Both models receive both, so each can lean on whichever suits its label.
     elo_by_k = {}
     train_elo_by_k = {}
     eval_elo_by_k  = {}
     for k in k_values:
         er = elo_mod.compute(games_df, k=k, window=_ELO_WINDOW)
+        er = _attach_ats_elo(er, games_df, k)
         elo_by_k[k]       = er
         _eval_mask = er.index.get_level_values("season") == eval_season
         train_elo_by_k[k] = er[~_eval_mask]
@@ -245,11 +279,18 @@ def _precompute(
     ]
 
     def _add_elo(df_base, common, elo_by_p, target):
+        """Return (elo_diff, opponent_elo, ats_elo_diff, ats_opp_elo)."""
+        _nan = np.full(len(common), np.nan)
         elo_grp = elo_by_p.get(target)
-        if elo_grp is not None:
-            ea = elo_grp.reindex(common)
-            return ea["elo_diff"].values, ea["opp_elo"].values
-        return np.full(len(common), np.nan), np.full(len(common), np.nan)
+        if elo_grp is None:
+            return _nan, _nan, _nan, _nan
+        ea = elo_grp.reindex(common)
+        return (
+            ea["elo_diff"].values,
+            ea["opp_elo"].values,
+            ea["ats_elo_diff"].values if "ats_elo_diff" in ea.columns else _nan,
+            ea["ats_opp_elo"].values  if "ats_opp_elo"  in ea.columns else _nan,
+        )
 
     for target in all_targets:
         # --- train split ---
@@ -271,7 +312,9 @@ def _precompute(
                 y_cov_tr, y_win_tr = _cover_and_win_labels(y_tr, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
-                    df_k["elo_diff"], df_k["opponent_elo"] = _add_elo(base, common, train_elo_by_k_p[k], target)
+                    (df_k["elo_diff"], df_k["opponent_elo"],
+                     df_k["ats_elo_diff"], df_k["ats_opp_elo"]) = _add_elo(
+                        base, common, train_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
                         if col not in _CAT_COLS:
@@ -297,7 +340,9 @@ def _precompute(
                 y_cov_ev, y_win_ev = _cover_and_win_labels(y_ev, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
-                    df_k["elo_diff"], df_k["opponent_elo"] = _add_elo(base, common, eval_elo_by_k_p[k], target)
+                    (df_k["elo_diff"], df_k["opponent_elo"],
+                     df_k["ats_elo_diff"], df_k["ats_opp_elo"]) = _add_elo(
+                        base, common, eval_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
                         if col not in _CAT_COLS:
@@ -432,7 +477,8 @@ def build_features(
         train_ctx = context[~context.index.get_level_values("season").isin([eval_season])]
         eval_ctx  = context[context.index.get_level_values("season") == eval_season]
 
-        elo_ratings = elo_mod.compute(games_df, k=best_k, window=_ELO_WINDOW)
+        elo_ratings = _attach_ats_elo(
+            elo_mod.compute(games_df, k=best_k, window=_ELO_WINDOW), games_df, best_k)
         train_elo   = elo_ratings[
             ~elo_ratings.index.get_level_values("season").isin([eval_season])
         ]
@@ -1017,6 +1063,10 @@ def _collect_window(
         elo_aligned  = elo_slice.reindex(common_idx)
         df["elo_diff"]     = elo_aligned["elo_diff"].values
         df["opponent_elo"] = elo_aligned["opp_elo"].values
+        for _src, _dst in (("ats_elo_diff", "ats_elo_diff"),
+                           ("ats_opp_elo", "ats_opp_elo")):
+            df[_dst] = (elo_aligned[_src].values
+                        if _src in elo_aligned.columns else np.nan)
     except KeyError:
         df["elo_diff"]     = np.nan
         df["opponent_elo"] = np.nan
@@ -1093,18 +1143,26 @@ def build_prediction_features(
         for col in _CTX_COLS:
             X[col] = np.nan
 
-    # Elo ratings for upcoming game (pre-game, using all completed games this season)
+    # Elo ratings for upcoming game (pre-game, using all completed games this season).
+    # Must mirror _precompute exactly — the model expects both the standard and
+    # the ATS rating, and a missing column at prediction time would silently
+    # become NaN for every team.
     elo_df = elo_mod.compute(completed, k=best_k, window=_ELO_WINDOW)
-    # Get most recent Elo per team (last period before next_period)
+    elo_df = _attach_ats_elo(elo_df, completed, best_k)
+    _elo_cols = ["elo", "opp_elo", "elo_diff", "ats_elo_diff", "ats_opp_elo"]
     latest_elo = (
         elo_df.reset_index()
         .sort_values("period")
         .groupby("team")
         .last()
-        [["elo", "opp_elo", "elo_diff"]]
+        [[c for c in _elo_cols if c in elo_df.columns]]
     )
     X["elo_diff"]     = X["team"].map(latest_elo["elo_diff"])
     X["opponent_elo"] = X["team"].map(latest_elo["opp_elo"])
+    X["ats_elo_diff"] = X["team"].map(latest_elo["ats_elo_diff"]) \
+        if "ats_elo_diff" in latest_elo.columns else np.nan
+    X["ats_opp_elo"]  = X["team"].map(latest_elo["ats_opp_elo"]) \
+        if "ats_opp_elo" in latest_elo.columns else np.nan
 
     # style_edge is not produced. It contributed nothing to the model, and
     # fitting the StyleModel here meant a full SVD of the season's matchup
