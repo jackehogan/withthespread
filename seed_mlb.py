@@ -41,6 +41,7 @@ def seed_mlb_season(
     skip_odds: bool = False,
     request_delay: float = 0.25,
     since: str | None = None,
+    max_odds_dates: int | None = 5,
 ) -> None:
     """
     Seed one MLB season into MongoDB.
@@ -148,6 +149,13 @@ def seed_mlb_season(
             return
 
         missing_dates = set(game_df["date"].dropna().astype(str).unique())
+
+        # A nightly run must only pay for the days it is actually seeding.
+        # Without this, one stale date anywhere in the season would pull the
+        # whole backlog at 20 credits each.
+        if since:
+            missing_dates = {d for d in missing_dates if d >= since}
+
         print(f"  {len(game_df)} game row(s) missing spreadscore across {len(missing_dates)} date(s).")
 
         # Odds come from the paid odds-api, not ESPN. ESPN's pickcenter exposes
@@ -156,9 +164,14 @@ def seed_mlb_season(
         # which silently made ml_implied_prob mean P(win) instead of P(cover).
         # The snapshot is taken at the same hour the prediction job runs, so
         # stored prices are the ones actually obtainable at decision time.
+        # Nightly (--since) runs are capped hard; a deliberate full-season
+        # reseed must opt in, since it costs ~2,600 credits for 2026.
+        _max_dates = 5 if since else max_odds_dates
         print(f"[2/4] Fetching run lines from odds-api for {len(missing_dates)} date(s)"
-              f"  (~{len(missing_dates) * 20} credits)...")
-        odds_df = dp.fetch_mlb_odds_api(missing_dates, request_delay=request_delay)
+              f"  (~{min(len(missing_dates), _max_dates or 10**6) * 20} credits)...")
+        odds_df = dp.fetch_mlb_odds_api(
+            missing_dates, request_delay=request_delay, max_dates=_max_dates
+        )
 
         if not odds_df.empty:
             odds_map = (
@@ -797,6 +810,13 @@ if __name__ == "__main__":
         help="Only fetch games on or after this date YYYY-MM-DD. "
              "Use for fast nightly incremental updates instead of re-pulling the full season."
     )
+    parser.add_argument(
+        "--max-odds-dates", type=int, default=5, dest="max_odds_dates",
+        help="Cap on dates fetched from the paid odds-api in one run "
+             "(20 credits each). Nightly --since runs are always capped at 5. "
+             "Raise this only for a deliberate backfill; a full 2026 season is "
+             "~130 dates / 2,600 credits."
+    )
     args = parser.parse_args()
 
     for season in sorted(args.seasons):
@@ -811,5 +831,6 @@ if __name__ == "__main__":
         elif args.sbr_web:
             seed_mlb_odds_sbr_web(season, request_delay=args.delay)
         else:
-            seed_mlb_season(season, skip_odds=args.skip_odds, request_delay=args.delay, since=args.since)
+            seed_mlb_season(season, skip_odds=args.skip_odds, request_delay=args.delay,
+                            since=args.since, max_odds_dates=args.max_odds_dates)
         time.sleep(1.0)

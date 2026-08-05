@@ -1062,6 +1062,7 @@ def fetch_mlb_odds_api(
     config_path: str = "data/config.txt",
     request_delay: float = 0.3,
     verbose: bool = True,
+    max_dates: int | None = 5,
 ) -> pd.DataFrame:
     """
     Fetch observed run lines and both market prices from the paid odds-api.
@@ -1074,15 +1075,28 @@ def fetch_mlb_odds_api(
         date, team, run_line, spread_juice, ml_odds, snapshot_ts
 
     Costs 20 credits per date (h2h + spreads, us region).
+
+    max_dates caps a single call and keeps the NEWEST dates, so a nightly run
+    can never sweep a whole season. A full 2026 season is ~130 dates = 2,600
+    credits, enough to exhaust a month's allowance in one command. Pass
+    max_dates=None deliberately for a backfill.
     """
     cfg = _read_config(config_path)
     key = cfg["spreads"]["key_paid"]
+
+    dates = sorted(dates)
+    if max_dates is not None and len(dates) > max_dates:
+        print(f"  odds-api: {len(dates)} dates requested but max_dates={max_dates}; "
+              f"keeping the {max_dates} most recent "
+              f"({dates[-max_dates]}..{dates[-1]}). "
+              f"Pass max_dates=None for an intentional backfill.")
+        dates = dates[-max_dates:]
 
     def _has_spreads(bm: dict) -> bool:
         return any(m.get("key") == "spreads" for m in bm.get("markets", []))
 
     records: list[dict] = []
-    for i, date in enumerate(sorted(dates), 1):
+    for i, date in enumerate(dates, 1):
         try:
             r = requests.get(
                 f"{_ODDS_API_BASE}/historical/sports/baseball_mlb/odds",
