@@ -412,24 +412,33 @@ def build_features(
         X_train_parts, y_train_parts, w_train_parts = [], [], []
         X_test_parts,  y_test_parts,  w_test_parts  = [], [], []
         X_val_parts,   y_val_parts,   w_val_parts   = [], [], []
+        # (team, season, period) per row, so predictions can be joined back to
+        # prices and outcomes. Without this a backtest cannot price its bets.
+        k_train, k_test, k_val = [], [], []
+
+        def _keys(common, target):
+            return [(t, s, target) for (t, s) in common]
 
         for start in range(1, next_period - lookback + 1):
             target = start + lookback
             if target in train_feats and train_n_prior.get(target, 0) >= lookback:
-                df, y, w, _ = train_feats[target]
+                df, y, w, common = train_feats[target]
                 X_train_parts.append(df)
                 y_train_parts.append(y)
                 w_train_parts.append(w)
+                k_train.extend(_keys(common, target))
             if target in eval_feats and eval_n_prior.get(target, 0) >= lookback:
-                df, y, w, _ = eval_feats[target]
+                df, y, w, common = eval_feats[target]
                 if target < eval_split_period:
                     X_test_parts.append(df)
                     y_test_parts.append(y)
                     w_test_parts.append(w)
+                    k_test.extend(_keys(common, target))
                 else:
                     X_val_parts.append(df)
                     y_val_parts.append(y)
                     w_val_parts.append(w)
+                    k_val.extend(_keys(common, target))
 
         if not X_train_parts:
             raise ValueError(
@@ -455,6 +464,10 @@ def build_features(
             "train": _cat_y(w_train_parts),
             "test":  _cat_y(w_test_parts),
             "val":   _cat_y(w_val_parts),
+            # Row identity, aligned positionally with each split's X and y.
+            "keys_train": k_train,
+            "keys_test":  k_test,
+            "keys_val":   k_val,
         }
         return X_train, X_test, y_train, y_test, X_val, y_val, style_model, win_labels
 
