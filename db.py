@@ -168,14 +168,14 @@ def update_prediction_results(
         game = game_col.find_one(
             {"sport": sport, "team": pred["team"],
              "season": season, "period": pred["period"]},
-            {"spreadscore": 1, "_id": 0},
+            {"spreadscore": 1, "diff": 1, "_id": 0},
         )
         if not game or game.get("spreadscore") is None:
             continue  # game not yet complete
 
         ss = float(game["spreadscore"])
 
-        # Covered / push / loss
+        # Covered / push / loss on the run line
         if ss > 0:
             covered = True
         elif ss < 0:
@@ -183,17 +183,30 @@ def update_prediction_results(
         else:
             covered = None  # push
 
-        # P&L for 1-unit flat bet — use the odds for whichever market was bet
+        # Grade the outcome that was actually BET, not always the run line.
+        # A team winning 1-0 wins the moneyline but fails to cover -1.5, so
+        # grading an ML bet on `covered` records a win as a loss and corrupts
+        # the per-market ROI used to judge which market carries edge.
         bet = pred.get("bet", "SPREAD")
+        if bet == "ML":
+            raw_diff = game.get("diff")
+            if raw_diff is None:
+                continue  # cannot grade a moneyline bet without the run diff
+            d = float(raw_diff)
+            won = True if d > 0 else (False if d < 0 else None)
+        else:
+            won = covered
+
+        # P&L for 1-unit flat bet — odds for whichever market was bet
         raw_juice = pred.get("ml_odds") if bet == "ML" else pred.get("moneyline")
         try:
             juice = float(raw_juice) if raw_juice is not None else -110.0
         except (TypeError, ValueError):
             juice = -110.0
 
-        if covered is None:
+        if won is None:
             pnl = 0.0
-        elif covered:
+        elif won:
             pnl = (100.0 / abs(juice)) if juice < 0 else (juice / 100.0)
         else:
             pnl = -1.0
@@ -211,7 +224,11 @@ def update_prediction_results(
         ops.append(UpdateOne(
             match_filter,
             {"$set": {
+                # `covered` always records the run-line outcome so historical
+                # analysis stays comparable; `bet_won` records whether the bet
+                # actually placed won, which is what pnl is derived from.
                 "covered":            covered,
+                "bet_won":            won,
                 "pnl":                round(pnl, 4),
                 "result_spreadscore": ss,
             }},
