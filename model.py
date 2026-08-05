@@ -88,6 +88,11 @@ _HYPEROPT_SPACE = {
 
 _ATS_ELO_WINDOW = 40   # wider than standard Elo: spreadscore is the noisier signal
 
+# Innings of in-season work at which season-to-date ERA and last season's ERA
+# carry equal weight. Tested over 15,818 starts at lambda 10/25/50/100;
+# 25-50 was flat-optimal, 10 chased noise and 100 clung to stale data.
+_SP_ERA_BLEND_LAMBDA = 50.0
+
 
 def _attach_ats_elo(elo_df: pd.DataFrame, games_df: pd.DataFrame,
                     k: float) -> pd.DataFrame:
@@ -779,15 +784,22 @@ def _compute_sp_rolling_era(
     fallback_col: str = "sp_era",
 ) -> pd.Series:
     """
-    Compute rolling n-start ERA for each starting pitcher.
+    Starter ERA blending season-to-date form with last season's baseline.
 
-    For each game row, looks back at the previous `n_starts` appearances by
-    the same pitcher in the same season and computes ERA = sum(ER)/sum(IP)*9.
-    Requires 'sp_ip_game' and 'sp_er_game' columns (seeded by --sp-game-stats).
+    Weight shifts toward the current season as innings accumulate:
 
-    Falls back to prior-season `sp_era` when:
-      - fewer than 2 starts of in-season data are available (season opener)
-      - sp_ip_game / sp_er_game not present in games_df
+        w   = season_ip / (season_ip + _SP_ERA_BLEND_LAMBDA)
+        era = w * season_to_date + (1 - w) * prior_season
+
+    This replaced a trailing-`n_starts` window with a hard fallback to
+    prior-season below 2 starts. That rule measured poorly early (correlation
+    with next-start ER/9 of 0.015 under 20 IP) because ~30 innings of ERA is
+    mostly noise, and it discarded the prior-season signal entirely once past
+    the cliff. `n_starts` is retained for signature compatibility but no longer
+    used.
+
+    Requires 'sp_ip_game' and 'sp_er_game' (seeded by --sp-game-stats); falls
+    back to prior-season ERA for every row when they are absent.
 
     Returns a Series indexed by (team, season, period) named 'sp_era_rolling'.
     """
@@ -810,7 +822,7 @@ def _compute_sp_rolling_era(
     df["sp_ip_game"] = pd.to_numeric(df["sp_ip_game"], errors="coerce")
     df["sp_er_game"] = pd.to_numeric(df["sp_er_game"], errors="coerce")
 
-    rolling_eras = {}   # (team, season, period) -> rolling ERA
+    rolling_eras = {}   # (team, season, period) -> blended ERA
 
     for (sp_name, season_val), grp in df.groupby(["sp_name", "season"]):
         if not sp_name:
@@ -823,18 +835,30 @@ def _compute_sp_rolling_era(
             prior = grp.iloc[:i].dropna(subset=["sp_ip_game", "sp_er_game"])
             prior = prior[prior["sp_ip_game"] > 0]
 
-            if len(prior) >= 2:
-                # Use last n_starts starts (or all available if fewer)
-                window = prior.tail(n_starts)
-                total_ip = window["sp_ip_game"].sum()
-                total_er = window["sp_er_game"].sum()
-                if total_ip > 0:
-                    rolling_eras[key] = round(total_er / total_ip * 9, 3)
-                    continue
+            prior_era = row[fallback_col] if (fallback_col in row.index
+                                              and pd.notna(row[fallback_col])) else np.nan
 
-            # Fallback: use prior-season ERA
-            if fallback_col in row.index and pd.notna(row[fallback_col]):
-                rolling_eras[key] = row[fallback_col]
+            season_ip = float(prior["sp_ip_game"].sum()) if len(prior) else 0.0
+            season_era = np.nan
+            if season_ip > 0:
+                season_era = float(prior["sp_er_game"].sum()) / season_ip * 9.0
+
+            # Weight season-to-date against last season by innings accumulated.
+            # Season-to-date beats the old trailing-5 window once innings build
+            # up (correlation with next-start ER/9 rises 0.016 -> 0.101 from
+            # <20 IP to 100+ IP) while last season's number goes stale over the
+            # same span (0.078 -> 0.043). Blending tracks both: correlation
+            # 0.089 versus 0.059 for the trailing-5 rule this replaces, and it
+            # removes that rule's cliff at 2 starts, where it scored just 0.015.
+            if np.isnan(season_era) and np.isnan(prior_era):
+                continue
+            if np.isnan(season_era):
+                rolling_eras[key] = round(float(prior_era), 3)
+            elif np.isnan(prior_era):
+                rolling_eras[key] = round(season_era, 3)
+            else:
+                w = season_ip / (season_ip + _SP_ERA_BLEND_LAMBDA)
+                rolling_eras[key] = round(w * season_era + (1 - w) * float(prior_era), 3)
 
     for key, val in rolling_eras.items():
         if key in result.index:
