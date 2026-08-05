@@ -1049,6 +1049,106 @@ def _sbr_best_opening_line(odds_views: list) -> dict | None:
     return None
 
 
+_ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+# Snapshot hour must match when the prediction job runs (cron '0 9 * * *').
+# EV has to be priced against odds obtainable at decision time, and a later
+# snapshot would encode lineups and scratches that did not exist at 5am.
+_ODDS_API_SNAPSHOT_HOUR = "09:00:00Z"
+_ODDS_API_BOOKS = ["fanduel", "draftkings", "betmgm", "caesars", "pointsbet"]
+
+
+def fetch_mlb_odds_api(
+    dates: set[str] | list[str],
+    config_path: str = "data/config.txt",
+    request_delay: float = 0.3,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetch observed run lines and both market prices from the paid odds-api.
+
+    Unlike ESPN — which exposes no run-line price at all, forcing the line to be
+    synthesised from a `favorite` boolean and the H2H price to be stored in its
+    place — this returns the real line plus both markets for the same game.
+
+    Returns a DataFrame with columns:
+        date, team, run_line, spread_juice, ml_odds, snapshot_ts
+
+    Costs 20 credits per date (h2h + spreads, us region).
+    """
+    cfg = _read_config(config_path)
+    key = cfg["spreads"]["key_paid"]
+
+    def _has_spreads(bm: dict) -> bool:
+        return any(m.get("key") == "spreads" for m in bm.get("markets", []))
+
+    records: list[dict] = []
+    for i, date in enumerate(sorted(dates), 1):
+        try:
+            r = requests.get(
+                f"{_ODDS_API_BASE}/historical/sports/baseball_mlb/odds",
+                params={"apiKey": key, "regions": "us", "markets": "h2h,spreads",
+                        "oddsFormat": "american",
+                        "date": f"{date}T{_ODDS_API_SNAPSHOT_HOUR}"},
+                timeout=30,
+            )
+        except Exception as exc:
+            print(f"  odds-api {date} request failed: {exc}")
+            continue
+        if r.status_code != 200:
+            print(f"  odds-api {date}: HTTP {r.status_code} {r.text[:120]}")
+            time.sleep(request_delay)
+            continue
+        if verbose and i == 1:
+            print(f"  odds-api credits remaining: "
+                  f"{r.headers.get('x-requests-remaining', '?')}")
+
+        payload = r.json()
+        snap_ts = payload.get("timestamp")
+        # Sort by start time so game 1 of a doubleheader precedes game 2.
+        board = sorted(payload.get("data", []),
+                       key=lambda g: g.get("commence_time") or "")
+
+        for g in board:
+            # Only keep games whose Eastern date matches the date requested;
+            # a 5am board also lists upcoming days.
+            if _et_date(g.get("commence_time", "")) != date:
+                continue
+            bms = g.get("bookmakers", [])
+            bm = next((b for want in _ODDS_API_BOOKS for b in bms
+                       if b.get("key") == want and _has_spreads(b)), None)
+            if bm is None:
+                bm = next((b for b in bms if _has_spreads(b)), None)
+            if bm is None:
+                continue
+
+            markets = {m["key"]: m for m in bm.get("markets", [])}
+            spreads = markets.get("spreads")
+            if not spreads:
+                continue
+            h2h = {o["name"]: o.get("price")
+                   for o in markets.get("h2h", {}).get("outcomes", [])}
+
+            for o in spreads.get("outcomes", []):
+                if o.get("point") is None or o.get("price") is None:
+                    continue
+                records.append({
+                    "date":         date,
+                    "team":         o["name"],
+                    "run_line":     float(o["point"]),
+                    "spread_juice": float(o["price"]),
+                    "ml_odds":      (float(h2h[o["name"]])
+                                     if h2h.get(o["name"]) is not None else None),
+                    "snapshot_ts":  snap_ts,
+                })
+        time.sleep(request_delay)
+
+    df = pd.DataFrame(records)
+    if verbose:
+        print(f"  odds-api returned {len(df)} team-rows across "
+              f"{df['date'].nunique() if not df.empty else 0} date(s).")
+    return df
+
+
 def fetch_mlb_odds_sbr_web(
     date: str,
     retries: int = 3,

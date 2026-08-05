@@ -150,30 +150,43 @@ def seed_mlb_season(
         missing_dates = set(game_df["date"].dropna().astype(str).unique())
         print(f"  {len(game_df)} game row(s) missing spreadscore across {len(missing_dates)} date(s).")
 
-        print(f"[2/4] Fetching run lines from ESPN for {len(missing_dates)} missing date(s)...")
-        odds_df = dp.fetch_mlb_odds_espn(
-            season, request_delay=request_delay, completed_dates=missing_dates
-        )
+        # Odds come from the paid odds-api, not ESPN. ESPN's pickcenter exposes
+        # no run-line price, so the old path synthesised the line from a
+        # `favorite` boolean and stored the H2H price in the run-line slot —
+        # which silently made ml_implied_prob mean P(win) instead of P(cover).
+        # The snapshot is taken at the same hour the prediction job runs, so
+        # stored prices are the ones actually obtainable at decision time.
+        print(f"[2/4] Fetching run lines from odds-api for {len(missing_dates)} date(s)"
+              f"  (~{len(missing_dates) * 20} credits)...")
+        odds_df = dp.fetch_mlb_odds_api(missing_dates, request_delay=request_delay)
 
         if not odds_df.empty:
             odds_map = (
                 odds_df.drop_duplicates(subset=["team", "date"], keep="first")
-                       .set_index(["team", "date"])[["run_line", "moneyline", "over_under"]]
+                       .set_index(["team", "date"])
+                       [["run_line", "spread_juice", "ml_odds", "snapshot_ts"]]
                        .to_dict("index")
             )
             keys = list(zip(game_df["team"], game_df["date"]))
-            game_df["spread"]     = [odds_map.get(k, {}).get("run_line")    for k in keys]
-            game_df["moneyline"]  = [odds_map.get(k, {}).get("moneyline")   for k in keys]
-            game_df["over_under"] = [odds_map.get(k, {}).get("over_under")  for k in keys]
+            game_df["spread"]       = [odds_map.get(k, {}).get("run_line")     for k in keys]
+            game_df["spread_juice"] = [odds_map.get(k, {}).get("spread_juice") for k in keys]
+            game_df["ml_odds"]      = [odds_map.get(k, {}).get("ml_odds")      for k in keys]
+            game_df["snapshot_ts"]  = [odds_map.get(k, {}).get("snapshot_ts")  for k in keys]
+            game_df["odds_source"]  = [
+                "odds-api-historical" if k in odds_map else None for k in keys
+            ]
+            # over_under is no longer fetched — nothing models totals, and
+            # dropping it keeps the request at 2 markets instead of 3.
+            game_df["over_under"] = None
 
             n_lines = game_df["spread"].notna().sum()
             print(f"  Run lines matched for {n_lines}/{len(game_df)} game rows "
                   f"({n_lines/len(game_df):.1%}).")
         else:
             print("  No odds data returned — storing games without run lines.")
-            game_df["spread"]     = None
-            game_df["moneyline"]  = None
-            game_df["over_under"] = None
+            for c in ("spread", "spread_juice", "ml_odds",
+                      "snapshot_ts", "odds_source", "over_under"):
+                game_df[c] = None
 
         # Compute SpreadScore = run_diff + run_line
         mask = game_df["spread"].notna()

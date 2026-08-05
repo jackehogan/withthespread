@@ -531,8 +531,10 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     # ml_implied_prob computed from stored moneyline (no-vig, both sides normalised)
     _PITCHER_COLS = ["sp_era", "sp_whip", "sp_k9", "sp_ip_per_start"]
     _BULLPEN_COLS = ["bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game"]
-    # moneyline loaded for ml_implied_prob computation but not output as a raw feature
-    _CTX_ODDS     = ["spread", "moneyline"] + _PITCHER_COLS + _BULLPEN_COLS
+    # Prices are loaded for ml_implied_prob but not output as raw features.
+    # spread_juice is the correctly-labelled run-line price; moneyline is the
+    # legacy overloaded column kept only as a fallback for un-migrated rows.
+    _CTX_ODDS     = ["spread", "spread_juice", "moneyline"] + _PITCHER_COLS + _BULLPEN_COLS
     _CTX_FEAT     = ["spread"] + _PITCHER_COLS + _BULLPEN_COLS  # features only
 
     needed = {"team", "season", "period", "date", "home"}
@@ -596,17 +598,30 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
         for c in _matchup_cols:
             df[c] = np.nan
 
-    # --- Moneyline implied probability (no-vig) ---
-    # Each row stores the team's run-line moneyline. We look up the opponent's
-    # moneyline for the same game, then normalise both sides to remove the vig.
-    # Result: 0.5 = market sees a coin flip, >0.5 = this team is favoured to cover.
-    if "moneyline" in df.columns and opp_present:
-        ml_lookup = df.set_index(["team", "season", "period"])["moneyline"]
-        opp_ml_keys = list(zip(df["opponent"], df["season"], df["period"]))
-        opp_ml = ml_lookup.reindex(opp_ml_keys)
+    # --- Run-line implied probability (no-vig) ---
+    # Look up the opponent's price for the same game and normalise both sides
+    # to strip the vig. 0.5 = market sees a coin flip, >0.5 = favoured to cover.
+    #
+    # Prefer spread_juice. The legacy `moneyline` column is NOT reliably the
+    # run-line price: ESPN-seeded seasons stored the H2H moneyline there, so
+    # this feature silently meant P(win) for some seasons and P(cover) for
+    # others. spread_juice is written only by sources known to price the run
+    # line, so falling back to `moneyline` is a last resort for rows predating
+    # the split.
+    _price_col = "spread_juice" if "spread_juice" in df.columns else "moneyline"
+    if _price_col in df.columns and opp_present:
+        price = df[_price_col]
+        if _price_col == "spread_juice" and "moneyline" in df.columns:
+            price = price.fillna(df["moneyline"])
+
+        tmp = df.assign(_price=price)
+        ml_lookup = tmp.set_index(["team", "season", "period"])["_price"]
+        opp_ml = ml_lookup.reindex(
+            list(zip(df["opponent"], df["season"], df["period"]))
+        )
         opp_ml.index = df.index
 
-        p_self = df["moneyline"].apply(_american_to_raw_prob)
+        p_self = price.apply(_american_to_raw_prob)
         p_opp  = opp_ml.apply(_american_to_raw_prob)
         total  = p_self + p_opp
         # Avoid division by zero when both sides are NaN
