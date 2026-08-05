@@ -100,11 +100,10 @@ def send_predictions_email(
     rows_html = []
     for team, row in preds.iterrows():
         ev = row.get("ev", float("nan"))
-        spread = row.get("spread", float("nan"))
-        juice = row.get("moneyline", float("nan"))
-        spread_str = f"{spread:+.1f}" if pd.notna(spread) else "?"
-        bet_str = f"{team.split()[-1]} {spread_str}"
-        prob_key   = "coverprob"
+        # Moneyline bets: price is ml_odds and the probability shown is P(win).
+        juice = row.get("ml_odds", float("nan"))
+        bet_str = f"{team.split()[-1]} ML"
+        prob_key   = "win_prob"
         juice_str  = f"{int(juice):+d}"    if pd.notna(juice) else "&#8212;"
         ev_str     = f"{ev:+.3f}"          if pd.notna(ev)    else "&#8212;"
         cover_str  = f"{row.get(prob_key, float('nan')):.1%}" if pd.notna(row.get(prob_key)) else "&#8212;"
@@ -871,37 +870,41 @@ def _run(
         axis=1,
     )
 
-    # Selecting max(ev_spread, ev_ml) is a selection procedure: with two noisy
-    # estimates the maximum is biased upward, so a bet chosen this way needs a
-    # higher bar than a single-market bet would. _EV_SELECTION_PENALTY is
-    # subtracted from the loser-of-two before comparing, and downstream min_ev
-    # thresholds should be set with this bias in mind.
-    _EV_SELECTION_PENALTY = 0.0   # tune once there is enough resolved history
-
-    def _pick(row):
-        s, m = row["ev_spread"], row["ev_ml"]
-        if pd.isna(m) and pd.isna(s):
-            return pd.Series({"bet": "SPREAD", "ev": np.nan})
-        if pd.isna(m):
-            return pd.Series({"bet": "SPREAD", "ev": s})
-        if pd.isna(s):
-            return pd.Series({"bet": "ML", "ev": m})
-        if m - _EV_SELECTION_PENALTY > s:
-            return pd.Series({"bet": "ML", "ev": m})
-        return pd.Series({"bet": "SPREAD", "ev": s})
-
-    preds[["bet", "ev"]] = preds.apply(_pick, axis=1)
+    # Bet the moneyline only. Backtested out of sample on 2026 (market-blind
+    # model), ROI at the 0.05 threshold:
+    #
+    #     run line only     5.4%
+    #     moneyline only   10.3%
+    #     max of the two    5.3%
+    #
+    # Taking max(ev_spread, ev_ml) never beat moneyline-only at any threshold.
+    # With two noisy estimates the maximum is biased upward, so the rule finds
+    # whichever market the model is most wrong about in the favourable
+    # direction rather than the one where it has an edge.
+    #
+    # The reason the moneyline is the better market is not that the model
+    # predicts winning better -- it predicts both about equally (AUC .5698
+    # covering, .5704 winning). It is that the book prices the run line far
+    # better than it prices the moneyline (.5996 vs .5650), because the run
+    # line needs a model of the MARGIN distribution and the book has one.
+    # Our team-strength signal transfers fully to the moneyline and only
+    # partly to the run line.
+    #
+    # ev_spread is still computed and stored for comparison.
+    preds["bet"] = "ML"
+    preds["ev"] = preds["ev_ml"]
 
     # Drop teams with no game scheduled today (no opponent in context)
     preds = preds[preds["opponent"].notna()]
 
-    # Drop games with no moneyline — EV cannot be computed and the model is
-    # missing ml_implied_prob, its key market-calibration feature.
-    no_odds = preds[preds["moneyline"].isna() & preds["ml_odds"].isna()]
+    # We bet the moneyline, so ml_odds is what EV needs. The run-line price is
+    # no longer sufficient. (The model itself needs no price at all now — see
+    # model._MARKET_BLIND — so this is purely about being able to price a bet.)
+    no_odds = preds[preds["ml_odds"].isna()]
     if not no_odds.empty:
-        print(f"  Dropped {len(no_odds)} team(s) with no moneyline data "
+        print(f"  Dropped {len(no_odds)} team(s) with no moneyline price "
               f"(no EV computable): {', '.join(no_odds.index.tolist())}")
-    preds = preds[preds["moneyline"].notna() | preds["ml_odds"].notna()]
+    preds = preds[preds["ml_odds"].notna()]
 
     if preds.empty:
         print("  No actionable predictions — all games missing odds data.")
@@ -1075,14 +1078,14 @@ if __name__ == "__main__":
         print("-" * 68)
         for team, row in result.iterrows():
             ev = row.get("ev", float("nan"))
-            spread = row.get("spread", float("nan"))
             dh = " G2" if row.get("game_num", 1) == 2 else "   "
-            juice = row.get("moneyline", float("nan"))
-            spread_str = f"{spread:+.1f}" if pd.notna(spread) else "?"
-            bet_str = f"{_abb(team)} {spread_str}"
+            # Moneyline bets: price and label come from ml_odds, not the run line.
+            juice = row.get("ml_odds", float("nan"))
+            bet_str = f"{_abb(team)} ML"
             opp = row.get("opponent") or "?"
             matchup = f"{_abb(opp)}@{_abb(team)}{dh}" if row.get("home", 0) == 1.0 else f"{_abb(team)}@{_abb(opp)}{dh}"
-            prob_key  = "coverprob"
+            # Show the probability for the market being bet: P(win), not P(cover).
+            prob_key  = "win_prob"
             juice_str = f"{int(juice):+d}" if pd.notna(juice) else "  --"
             ev_str    = f"{ev:+.3f}"       if pd.notna(ev)    else "    --"
             cover_str = f"{row.get(prob_key, float('nan')):.1%}" if pd.notna(row.get(prob_key)) else "  --"

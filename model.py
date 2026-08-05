@@ -86,6 +86,24 @@ _HYPEROPT_SPACE = {
 # Feature engineering
 # ---------------------------------------------------------------------------
 
+# The model does not see any market price. It forms a view from team ratings
+# and box-score history alone, and the price is used only to size and select
+# the bet afterwards.
+#
+# Rationale, measured out of sample on 2026:
+#   * With ml_implied_prob included, a positive EV partly reflects the model
+#     failing to reproduce a price it was shown, which is uninterpretable.
+#   * Removing it costs the WIN model almost nothing (AUC .5808 -> .5699,
+#     against the market's own .5650) because that feature is derived from the
+#     run-line price and carried only 2.45% of the win model's gain.
+#   * Moneyline ROI at the 0.05 threshold: 11.7% with the feature, 10.3%
+#     without. ~1.4 points buys EV that actually means something.
+#
+# _compute_context still computes ml_implied_prob — predict_mlb reports it for
+# comparison — it is simply excluded from the feature matrix.
+_MARKET_BLIND = True
+_MARKET_FEATURES = ("ml_implied_prob", "spread")
+
 _ATS_ELO_WINDOW = 40   # wider than standard Elo: spreadscore is the noisier signal
 
 # Innings of in-season work at which season-to-date ERA and last season's ERA
@@ -282,6 +300,9 @@ def _precompute(
         "ml_implied_prob",
         "bp_ip_14d",
     ]
+
+    if _MARKET_BLIND:
+        _CTX = [c for c in _CTX if c not in _MARKET_FEATURES]
 
     def _add_elo(df_base, common, elo_by_p, target):
         """Return (elo_diff, opponent_elo, ats_elo_diff, ats_opp_elo)."""
@@ -1173,6 +1194,9 @@ def build_prediction_features(
         "ml_implied_prob",
         "bp_ip_14d",
     ]
+    if _MARKET_BLIND:
+        _CTX_COLS = [c for c in _CTX_COLS if c not in _MARKET_FEATURES]
+
     if upcoming_context is not None and not upcoming_context.empty:
         for col in _CTX_COLS:
             X[col] = X["team"].map(upcoming_context[col]) if col in upcoming_context.columns else np.nan
