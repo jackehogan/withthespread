@@ -477,6 +477,23 @@ class ProphetXClient:
             line_id  = market["line_id"]
             px_odds  = float(market["px_odds"])
 
+            # `markets` comes from get_mlb_run_lines, so every line_id here is a
+            # RUN LINE. Since the dual-target change, preds can carry bet="ML",
+            # and pricing those with coverprob against a run-line id would place
+            # a spread wager while recording it as a moneyline bet. Refuse
+            # rather than mis-bet; moneyline support needs its own market fetch.
+            if bet_market != "SPREAD":
+                results.append({
+                    "team": team, "bet": bet_market, "model_ev": model_ev,
+                    "ev": float("nan"), "coverprob": coverprob,
+                    "line_id": line_id, "requested_odds": px_odds,
+                    "stake": 0.0, "snapped_odds": None,
+                    "status": "UNSUPPORTED_MARKET", "wager_id": None,
+                    "error": f"bet={bet_market} but only run-line markets are "
+                             f"fetched; moneyline placement is not implemented",
+                })
+                continue
+
             # Re-price against the exchange's own book.  `preds["ev"]` was
             # computed against a different sportsbook's number, so it says
             # nothing about whether this wager is +EV at ProphetX's price.
