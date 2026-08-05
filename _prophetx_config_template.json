@@ -1,0 +1,18 @@
+{
+  "_comment": "Paste this `prophetx` block into data/config.txt alongside the existing mongo/spreads/email blocks, then fill in your own sandbox keys. Nothing here places a real wager: sandbox routes to api-ss-sandbox.betprophet.co and dry_run logs what would be staked without sending it. Both must be flipped to false, deliberately, before any real money moves.",
+
+  "prophetx": {
+    "access_key": "PASTE_YOUR_SANDBOX_ACCESS_KEY",
+    "secret_key": "PASTE_YOUR_SANDBOX_SECRET_KEY",
+
+    "sandbox": true,
+    "dry_run": true,
+    "enabled": true,
+
+    "bankroll": 1000.0,
+    "kelly_fraction": 0.10,
+    "min_ev": 0.05,
+    "max_stake": 50.0,
+    "max_total_stake": 250.0
+  }
+}
