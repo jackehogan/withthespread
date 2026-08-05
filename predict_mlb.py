@@ -583,15 +583,27 @@ def _run(
         _recent_n   = min(_ODDS_LOOKBACK_GAMES, len(_recent_season))
         _recent_g   = _recent_season.nlargest(_recent_n, "period") if "period" in _recent_season.columns else _recent_season.tail(_recent_n)
         _spread_fill = _recent_g["spread"].notna().mean()
-        _ml_fill     = _recent_g["moneyline"].notna().mean() if "moneyline" in _recent_g.columns else 0.0
+        # Check the run-line price the model actually consumes. spread_juice is
+        # the correctly-labelled column; `moneyline` is the legacy overloaded
+        # one and is empty on rows seeded since the split, so checking it alone
+        # made this gate abort on freshly-seeded data.
+        if "spread_juice" in _recent_g.columns:
+            _price = _recent_g["spread_juice"]
+            if "moneyline" in _recent_g.columns:
+                _price = _price.fillna(_recent_g["moneyline"])
+        elif "moneyline" in _recent_g.columns:
+            _price = _recent_g["moneyline"]
+        else:
+            _price = pd.Series(dtype=float)
+        _ml_fill = _price.notna().mean() if len(_price) else 0.0
         if _spread_fill < _ODDS_MIN_FILL or _ml_fill < _ODDS_MIN_FILL:
             print(f"  ERROR: Odds coverage too low on last {_recent_n} game rows — "
-                  f"spread={_spread_fill:.0%}, moneyline={_ml_fill:.0%} "
+                  f"spread={_spread_fill:.0%}, run-line price={_ml_fill:.0%} "
                   f"(minimum {_ODDS_MIN_FILL:.0%}). "
                   f"Run seed_mlb.py to backfill odds before predicting.")
             return pd.DataFrame()
         print(f"[0/5] Data current through {_most_recent.date()}. "
-              f"Odds coverage OK (spread={_spread_fill:.0%}, ML={_ml_fill:.0%}).")
+              f"Odds coverage OK (spread={_spread_fill:.0%}, price={_ml_fill:.0%}).")
     else:
         print(f"[0/5] Data current through {_most_recent.date()}. OK.")
 
