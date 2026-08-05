@@ -66,6 +66,7 @@ def compute(
     window: int = 20,
     initial_rating: float = _INITIAL_RATING,
     scale: float = _SCALE,
+    value_col: str = "diff",
 ) -> pd.DataFrame:
     """
     Compute pre-game Elo ratings for every (team, season, period).
@@ -80,6 +81,15 @@ def compute(
                      Full-season cumulative is equivalent to window=None.
     initial_rating : starting rating each season.
     scale          : point diff divisor in sigmoid (higher = less sensitive to margins).
+    value_col      : outcome column driving the update.
+                     "diff"        -> rates who WINS (pure performance).
+                     "spreadscore" -> rates who COVERS the run line, which is
+                                      what the model actually predicts. Since
+                                      the MLB run line is fixed at +/-1.5,
+                                      spreadscore is diff offset by favourite
+                                      status, so this credits underdogs for
+                                      keeping games close and penalises
+                                      favourites for narrow wins.
 
     Returns
     -------
@@ -88,13 +98,13 @@ def compute(
         opp_elo     : opponent's Elo BEFORE this game
         elo_diff    : elo - opp_elo
     """
-    needed = {"team", "opponent", "season", "period", "diff"}
+    needed = {"team", "opponent", "season", "period", value_col}
     if not needed.issubset(games_df.columns):
         raise ValueError(f"games_df missing columns: {needed - set(games_df.columns)}")
 
     df = (
         games_df[list(needed)]
-        .dropna(subset=["opponent", "diff"])
+        .dropna(subset=["opponent", value_col])
         .sort_values(["season", "period"])
         .copy()
     )
@@ -161,7 +171,7 @@ def compute(
                 game_key = (period, key)
                 if game_key not in seen_games:
                     seen_games.add(game_key)
-                    game_log.append((period, team, opp, float(row["diff"])))
+                    game_log.append((period, team, opp, float(row[value_col])))
 
             # Update cumulative ratings (only used when window=None)
             if window is None:
@@ -174,7 +184,7 @@ def compute(
                         continue
                     processed.add(key)
                     r_t  = pre[team];  r_o = pre[opp]
-                    d    = float(row["diff"])
+                    d    = float(row[value_col])
                     s_t  = 1.0 / (1.0 + math.exp(-d / scale))
                     e_t  = 1.0 / (1.0 + 10 ** ((r_o - r_t) / 400))
                     cum_ratings[team] = r_t + k * (s_t - e_t)
