@@ -763,12 +763,11 @@ def _run(
         print("  Run _kelly_analysis.py to train and save the model first.")
         return pd.DataFrame()
 
-    # Rebuild style_model from current season data up to next_period.
-    # This is always season-specific so it must be recomputed each run.
-    import embeddings as _emb
-    style_model = _emb.fit(
-        season_games[season_games["period"] < next_period], k=3, verbose=False
-    )
+    # The StyleModel used to be refit here on every run — a full SVD of the
+    # season's matchup matrix — purely to produce style_edge, which the model
+    # does not use (see model._USE_STYLE_EDGE). Skipped; nothing downstream
+    # needs it, and build_prediction_features accepts None.
+    style_model = None
     print(f"  lookback={best_lookback}, Elo K={best_k}, bp_ip_14d={ml._BP_FATIGUE_DAYS}d (fixed) | "
           f"val ROC={scores.get('clf_val_roc', float('nan')):.3f}  "
           f"val acc={scores.get('clf_val_acc', float('nan')):.1%}")

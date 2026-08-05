@@ -56,6 +56,22 @@ _K_CANDIDATES            = [16, 32, 48, 64]
 _ELO_WINDOW              = 20    # EDA showed 20-game window has ~8x signal vs full-season cumulative
 _BP_FATIGUE_DAYS         = 14    # fixed rolling window for bp_ip_14d — not a hyperparameter
 
+# style_edge is not fed to the model. Measured on the 2025 hold-out it scored
+# exactly 0.00 on both SHAP and XGBoost gain — the trees never split on it once
+# — and removing the whole block cost 0.0000 test ROC.
+#
+# Out-of-sample testing showed why. The SVD was factorising raw run
+# differential, which is team strength, so it only ever duplicated Elo with
+# more noise. Residualising strength out first (the correct fix) left nothing:
+# correlation with out-of-sample matchup residuals was 0.002 per game and
+# -0.000 aggregated per team pair, across k=1..3, several shrinkage levels and
+# multi-season pooling. At ~2.7 games per team pair there is no recoverable
+# low-rank matchup effect above roughly 0.1 runs.
+#
+# The StyleModel plumbing is left intact so the saved bundle format still
+# loads; only the feature injection is removed.
+_USE_STYLE_EDGE          = False
+
 _HYPEROPT_SPACE = {
     "learning_rate": hp.uniform("learning_rate", 0.01, 0.3),
     "max_depth": hp.quniform("max_depth", 2, 5, 1),
@@ -223,8 +239,7 @@ def _precompute(
                 ctx_grp = train_ctx_by_p.get(target)
                 for col in _CTX:
                     base[col] = ctx_grp.reindex(common)[col].values if (ctx_grp is not None and col in ctx_grp.columns) else np.nan
-                sty_grp = train_style_by_p.get(target)
-                base["style_edge"] = sty_grp.reindex(common).values if sty_grp is not None else np.nan
+                # style_edge deliberately omitted — see _USE_STYLE_EDGE.
                 for k in k_values:
                     df_k = base.copy()
                     df_k["elo_diff"], df_k["opponent_elo"] = _add_elo(base, common, train_elo_by_k_p[k], target)
@@ -248,8 +263,7 @@ def _precompute(
                 ctx_grp = eval_ctx_by_p.get(target)
                 for col in _CTX:
                     base[col] = ctx_grp.reindex(common)[col].values if (ctx_grp is not None and col in ctx_grp.columns) else np.nan
-                sty_grp = eval_style_by_p.get(target)
-                base["style_edge"] = sty_grp.reindex(common).values if sty_grp is not None else np.nan
+                # style_edge deliberately omitted — see _USE_STYLE_EDGE.
                 for k in k_values:
                     df_k = base.copy()
                     df_k["elo_diff"], df_k["opponent_elo"] = _add_elo(base, common, eval_elo_by_k_p[k], target)
@@ -927,12 +941,8 @@ def _collect_window(
         for col in _CTX_COLS:
             df[col] = np.nan
 
-    # --- Playstyle edge ---
-    try:
-        style_slice  = style_edges.xs(target, level="period")
-        df["style_edge"] = style_slice.reindex(common_idx).values
-    except KeyError:
-        df["style_edge"] = np.nan
+    # style_edge is intentionally not added to the feature matrix — it
+    # measured exactly 0.00 on both SHAP and gain. See _USE_STYLE_EDGE.
 
     # --- Elo ratings ---
     try:
@@ -1029,22 +1039,10 @@ def build_prediction_features(
     X["elo_diff"]     = X["team"].map(latest_elo["elo_diff"])
     X["opponent_elo"] = X["team"].map(latest_elo["opp_elo"])
 
-    # Playstyle edge — fit on completed games this season (period < next_period)
-    # so we only use information available at prediction time
-    if style_model is None:
-        completed_games = completed  # already filtered to period < next_period
-        style_model = emb.fit(completed_games, k=3)
-
-    if style_model is not None and upcoming_context is not None and "opponent" in upcoming_context.columns:
-        X["style_edge"] = X.apply(
-            lambda r: style_model.predict_edge(
-                r["team"],
-                upcoming_context.loc[r["team"], "opponent"]
-            ) if r["team"] in upcoming_context.index else np.nan,
-            axis=1,
-        )
-    else:
-        X["style_edge"] = np.nan
+    # style_edge is not produced. It contributed nothing to the model, and
+    # fitting the StyleModel here meant a full SVD of the season's matchup
+    # matrix on every prediction run. Note this used to refit even when the
+    # caller passed style_model=None. See _USE_STYLE_EDGE.
 
     _recast_categoricals(X)
     for col in X.columns:
