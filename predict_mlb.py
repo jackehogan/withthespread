@@ -99,6 +99,18 @@ def send_predictions_email(
         except (TypeError, ValueError):
             return None
 
+    # Order by recommended stake, largest first, so the biggest commitments are
+    # read first. Kelly size is a function of both EV and price, so this is not
+    # the same ordering as EV alone. Rows with no recommended bet sort last.
+    _stakes = {
+        team: (_kelly_bet(row.get("ev", float("nan")),
+                          row.get("ml_odds", float("nan"))) or 0.0)
+        for team, row in preds.iterrows()
+    }
+    preds = preds.loc[
+        sorted(preds.index, key=lambda t: (-_stakes.get(t, 0.0), t))
+    ]
+
     rows_html = []
     for team, row in preds.iterrows():
         ev = row.get("ev", float("nan"))
@@ -251,6 +263,23 @@ def fetch_upcoming_mlb_games(target_date: str) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
+
+    # Verify every game really starts on the requested Eastern date. statsapi
+    # is asked for one date and returns that date's official games, but the
+    # start times are UTC, so this confirms the two agree rather than assuming
+    # it — the same mismatch that silently dropped West-Coast games elsewhere.
+    if "game_datetime" in df.columns:
+        et_dates = df["game_datetime"].apply(
+            lambda s: _et_time_date(s) if s else target_date)
+        off_day = df[et_dates != target_date]
+        if not off_day.empty:
+            for _, r in off_day.iterrows():
+                print(f"  WARN: dropping {r['away_team']} @ {r['home_team']} — "
+                      f"starts {et_dates[_]} ET, not {target_date}")
+            df = df[et_dates == target_date]
+        if df.empty:
+            return pd.DataFrame()
+
     # Number games per matchup to flag doubleheaders
     df["game_num"] = df.groupby(["home_team", "away_team"]).cumcount() + 1
     return df
@@ -259,6 +288,19 @@ def fetch_upcoming_mlb_games(target_date: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Upcoming context assembly
 # ---------------------------------------------------------------------------
+
+def _et_time_date(iso_utc: str) -> str:
+    """Eastern calendar date ('YYYY-MM-DD') of a UTC ISO timestamp."""
+    if not iso_utc:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso_utc).replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
 
 def _et_time(iso_utc: str) -> str:
     """Render a UTC ISO timestamp as Eastern clock time, e.g. '7:05 PM ET'."""
@@ -310,6 +352,36 @@ def build_upcoming_context_mlb(
     """
     if schedule_df.empty:
         return pd.DataFrame()
+
+    # --- Same-day guard -------------------------------------------------
+    # The odds board lists several days ahead, and odds are matched to teams by
+    # NAME only. A team playing today and tomorrow could therefore be priced
+    # off tomorrow's game. Restrict the board to the dates actually being
+    # predicted before any lookup happens.
+    target_dates = set(schedule_df["game_date"].astype(str).unique())
+    if len(target_dates) > 1:
+        print(f"  WARN: schedule spans multiple dates {sorted(target_dates)} — "
+              f"expected a single day.")
+
+    if not spreads_df.empty and "game_date" in spreads_df.columns:
+        _before = len(spreads_df)
+        spreads_df = spreads_df[spreads_df["game_date"].astype(str).isin(target_dates)]
+        _dropped = _before - len(spreads_df)
+        if _dropped:
+            print(f"  Odds rows dropped for other dates: {_dropped} "
+                  f"(kept {len(spreads_df)} for {sorted(target_dates)})")
+    elif not spreads_df.empty:
+        print("  WARN: odds have no game_date column — cannot verify they are "
+              "for today. Prices may come from another day's game.")
+
+    # Any team appearing twice on the board for these dates is a doubleheader;
+    # the first occurrence is kept upstream, so flag it rather than silently
+    # pricing game 2 off game 1.
+    if not spreads_df.empty:
+        _dupes = spreads_df.index[spreads_df.index.duplicated()].unique().tolist()
+        if _dupes:
+            print(f"  NOTE: {len(_dupes)} team(s) have multiple games on the "
+                  f"board today (doubleheaders): {', '.join(map(str, _dupes[:5]))}")
 
     # Last played date per team — for is_b2b
     last_date: dict[str, str] = {}
