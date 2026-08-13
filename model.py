@@ -141,26 +141,38 @@ def _cover_and_win_labels(ss_vals, ctx_aligned) -> tuple[pd.Series, pd.Series]:
     """
     Derive both prediction targets from the same rows.
 
-        cover = spreadscore > 0
-        win   = diff > 0, and diff = spreadscore - spread
+        cover = spreadscore > 0     (did the team beat the run line)
+        win   = diff > 0            (did the team win the game)
 
-    No extra pivot is needed: raw spreadscore is still in hand at this point
-    and `spread` comes from the context already fetched for the feature matrix.
+    `diff` is the raw run differential and is read straight from the context
+    frame, which carries it for exactly this purpose. Winning outright has
+    nothing to do with the run line, so the win label must not depend on
+    `spread` being present.
 
-    Win is NaN wherever spread is missing, since diff cannot be recovered
-    there. Those rows are dropped when fitting the win model but still train
-    the cover model, so neither target loses rows unnecessarily.
+    The legacy route reconstructed it as `spreadscore - spread`, inverting
+    seed_mlb's `spreadscore = diff + spread`. That was a carry-over from
+    sports where the line moves and only the spread-relative result was
+    stored. It returns the same number when `spread` is present and NaN when
+    it is not, silently dropping those rows from win training. It is kept
+    below as a fallback for context frames built before `diff` was carried.
+
+    Win is NaN only where the game result itself is unavailable.
     """
     ss = np.asarray(ss_vals, dtype=float)
     cover = pd.Series((ss > 0).astype(float), dtype=float)
 
-    if ctx_aligned is not None and "spread" in ctx_aligned.columns:
-        spread = pd.to_numeric(ctx_aligned["spread"], errors="coerce").values
-        diff = ss - spread
-        win = pd.Series(np.where(np.isnan(diff), np.nan, (diff > 0).astype(float)),
-                        dtype=float)
-    else:
-        win = pd.Series(np.full(len(ss), np.nan), dtype=float)
+    diff = None
+    if ctx_aligned is not None and "diff" in ctx_aligned.columns:
+        diff = pd.to_numeric(ctx_aligned["diff"], errors="coerce").values
+    if diff is None or np.isnan(diff).all():
+        if ctx_aligned is not None and "spread" in ctx_aligned.columns:
+            spread = pd.to_numeric(ctx_aligned["spread"], errors="coerce").values
+            diff = ss - spread
+        else:
+            diff = np.full(len(ss), np.nan)
+
+    win = pd.Series(np.where(np.isnan(diff), np.nan, (diff > 0).astype(float)),
+                    dtype=float)
     return cover, win
 
 
@@ -673,6 +685,11 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     # legacy overloaded column kept only as a fallback for un-migrated rows.
     _CTX_ODDS     = ["spread", "spread_juice", "moneyline"] + _PITCHER_COLS + _BULLPEN_COLS
     _CTX_FEAT     = ["spread"] + _PITCHER_COLS + _BULLPEN_COLS  # features only
+    # Outcome columns carried through for label construction ONLY. These are
+    # results, so they must never appear in a feature allowlist -- see _CTX in
+    # _precompute and _CTX_COLS in _collect_window / build_upcoming_features,
+    # none of which include them.
+    _LABEL_COLS   = ["diff"]
 
     needed = {"team", "season", "period", "date", "home"}
     _matchup_cols = [
@@ -682,16 +699,17 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
         "ml_implied_prob",
         "bp_ip_14d",   # rolling N-day bullpen fatigue (seeded separately)
     ]
-    _all_out = ["home", "is_b2b"] + _CTX_FEAT + _matchup_cols
+    _all_out = ["home", "is_b2b"] + _CTX_FEAT + _matchup_cols + _LABEL_COLS
 
     if not needed.issubset(games_df.columns):
         idx = pd.MultiIndex.from_frame(games_df[["team", "season", "period"]])
         return pd.DataFrame({c: np.nan for c in _all_out}, index=idx)
 
-    odds_present = [c for c in _CTX_ODDS if c in games_df.columns]
-    opp_present  = "opponent" in games_df.columns
+    odds_present  = [c for c in _CTX_ODDS if c in games_df.columns]
+    label_present = [c for c in _LABEL_COLS if c in games_df.columns]
+    opp_present   = "opponent" in games_df.columns
 
-    cols = ["team", "season", "period", "date", "home"] + odds_present
+    cols = ["team", "season", "period", "date", "home"] + odds_present + label_present
     if opp_present:
         cols.append("opponent")
 
@@ -702,7 +720,7 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     df["is_b2b"] = (rest == 1).astype(float)
     df["home"]   = df["home"].astype(float)
 
-    for c in _CTX_ODDS:
+    for c in _CTX_ODDS + _LABEL_COLS:
         if c not in df.columns:
             df[c] = np.nan
 
