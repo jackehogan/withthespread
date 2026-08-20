@@ -146,6 +146,12 @@ def update_prediction_results(
                       push : 0.0
         result_spreadscore : the actual spreadscore from the game document
 
+    The game is located by DATE, not by period. A prediction's `period` is the
+    model's forward-looking counter and drifts from the period actually stored
+    on that team's game row (measured offsets of -4..+3 over Aug 2026), so a
+    period-keyed lookup silently graded ~a third of bets against a different
+    game of the same team's season. `opponent` breaks the tie on doubleheaders.
+
     Safe to call repeatedly — only updates documents still missing 'covered'.
 
     Returns the number of predictions updated.
@@ -157,7 +163,7 @@ def update_prediction_results(
     # Fetch prediction_date so we can use it as the update key.
     pending = list(pred_col.find(
         {"sport": sport, "season": season, "covered": {"$exists": False}, "ev": {"$gt": 0}},
-        {"_id": 0, "team": 1, "period": 1, "prediction_date": 1,
+        {"_id": 0, "team": 1, "period": 1, "prediction_date": 1, "opponent": 1,
          "moneyline": 1, "ml_odds": 1, "spread": 1, "ev": 1, "bet": 1},
     ))
     if not pending:
@@ -165,13 +171,28 @@ def update_prediction_results(
 
     ops = []
     for pred in pending:
-        game = game_col.find_one(
-            {"sport": sport, "team": pred["team"],
-             "season": season, "period": pred["period"]},
-            {"spreadscore": 1, "diff": 1, "_id": 0},
-        )
+        # Date is the only key both collections agree on. Fall back to period
+        # only for legacy predictions that predate prediction_date.
+        pred_date = pred.get("prediction_date")
+        _proj = {"spreadscore": 1, "diff": 1, "period": 1, "_id": 0}
+        game = None
+        if pred_date:
+            q = {"sport": sport, "team": pred["team"],
+                 "season": season, "date": pred_date}
+            if pred.get("opponent"):
+                # Doubleheader tiebreak; retry without it if the opponent
+                # string does not match between collections.
+                game = game_col.find_one({**q, "opponent": pred["opponent"]}, _proj)
+            if game is None:
+                game = game_col.find_one(q, _proj)
+        else:
+            game = game_col.find_one(
+                {"sport": sport, "team": pred["team"],
+                 "season": season, "period": pred["period"]},
+                _proj,
+            )
         if not game or game.get("spreadscore") is None:
-            continue  # game not yet complete
+            continue  # game not yet complete, or no game that day
 
         ss = float(game["spreadscore"])
 
@@ -213,7 +234,6 @@ def update_prediction_results(
 
         # Match on (sport, team, season, prediction_date) — the prediction key.
         # Fall back to period-based match for legacy records without prediction_date.
-        pred_date = pred.get("prediction_date")
         if pred_date:
             match_filter = {"sport": sport, "team": pred["team"],
                             "season": season, "prediction_date": pred_date}
@@ -231,6 +251,8 @@ def update_prediction_results(
                 "bet_won":            won,
                 "pnl":                round(pnl, 4),
                 "result_spreadscore": ss,
+                # period of the game actually graded, for auditing the join
+                "result_period":      game.get("period"),
             }},
             upsert=False,
         ))
