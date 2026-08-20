@@ -1011,8 +1011,14 @@ def _run(
     if top_n:
         preds = preds.head(top_n)
 
-    # SHAP top-3 reasons per team
-    preds["reasons"] = _shap_reasons(clf, X_pred, preds.index)
+    # SHAP top-3 reasons per team, explained against the model that actually
+    # drove the bet. Since the moneyline restructure that is win_clf; using the
+    # cover model here described why a team should beat the run line next to a
+    # bet on it winning outright, which are different questions (ats_elo_diff
+    # is rank 2 of 27 by gain in the cover model and rank 12 of 26 in the win
+    # model). Falls back to clf for bundles saved without a win model.
+    _reason_clf = _bundle.get("win_clf") if str(preds["bet"].iloc[0]) == "ML" else clf
+    preds["reasons"] = _shap_reasons(_reason_clf or clf, X_pred, preds.index)
 
     # Upsert to MongoDB
     db.upsert_predictions(client, [

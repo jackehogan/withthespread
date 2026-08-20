@@ -105,6 +105,26 @@ _MARKET_BLIND = True
 _MARKET_FEATURES = ("ml_implied_prob", "spread")
 
 _ATS_ELO_WINDOW = 40   # wider than standard Elo: spreadscore is the noisier signal
+_LONG_ELO_WINDOW = 40  # same horizon as ATS Elo, but driven by diff, not spreadscore
+
+# Features built on spreadscore ( = diff + spread ). The run line's sign is the
+# book's favourite/underdog call, so these carry market information even though
+# _MARKET_BLIND drops `spread` and `ml_implied_prob` as explicit columns. They
+# are correct for the COVER target and structurally wrong for the WIN target:
+# ss_mean_5 sums a performance term and a market term that point opposite ways,
+# and scores AUC 0.4992 against winning -- a coin flip -- while its components
+# score 0.5272 and 0.5549 separately.
+#
+# The win model is therefore fit without them, on diff-based equivalents
+# instead. Measured on 2026 (trained 2022-2025): dropping them outright costs
+# 0.0087 AUC (.5737 -> .5650); replacing them with the diff versions recovers
+# .5729, i.e. the signal was performance, not market. Adding recent-favourite
+# rate back explicitly gains nothing (.5730), confirming the market term is
+# already carried by Elo.
+_SPREAD_DERIVED_FEATURES = (
+    "ats_elo_diff", "ats_opp_elo", "1_ago_ss", "ss_mean_5",
+    "cover_streak", "fade_streak",
+)
 
 # Innings of in-season work at which season-to-date ERA and last season's ERA
 # carry equal weight. Tested over 15,818 starts at lambda 10/25/50/100;
@@ -134,6 +154,29 @@ def _attach_ats_elo(elo_df: pd.DataFrame, games_df: pd.DataFrame,
                           value_col="spreadscore")
     elo_df["ats_elo_diff"] = ats["elo_diff"].reindex(elo_df.index)
     elo_df["ats_opp_elo"]  = ats["opp_elo"].reindex(elo_df.index)
+    return elo_df
+
+
+def _attach_long_elo(elo_df: pd.DataFrame, games_df: pd.DataFrame,
+                     k: float) -> pd.DataFrame:
+    """
+    Add long_elo_diff / long_opp_elo: the same 40-game horizon ATS Elo uses,
+    but driven by `diff`, so it rates winning rather than covering. This is the
+    market-free counterpart to the ATS pair, and the win model's replacement
+    for it.
+    """
+    if "diff" not in games_df.columns:
+        elo_df["long_elo_diff"] = np.nan
+        elo_df["long_opp_elo"] = np.nan
+        return elo_df
+    sub = games_df.dropna(subset=["diff"])
+    if sub.empty:
+        elo_df["long_elo_diff"] = np.nan
+        elo_df["long_opp_elo"] = np.nan
+        return elo_df
+    lg = elo_mod.compute(sub, k=k, window=_LONG_ELO_WINDOW, value_col="diff")
+    elo_df["long_elo_diff"] = lg["elo_diff"].reindex(elo_df.index)
+    elo_df["long_opp_elo"]  = lg["opp_elo"].reindex(elo_df.index)
     return elo_df
 
 
@@ -223,6 +266,7 @@ def _precompute(
     for k in k_values:
         er = elo_mod.compute(games_df, k=k, window=_ELO_WINDOW)
         er = _attach_ats_elo(er, games_df, k)
+        er = _attach_long_elo(er, games_df, k)
         elo_by_k[k]       = er
         _eval_mask = er.index.get_level_values("season") == eval_season
         train_elo_by_k[k] = er[~_eval_mask]
@@ -311,23 +355,26 @@ def _precompute(
         "opp_bp_era", "opp_bp_whip", "bp_era_edge",
         "ml_implied_prob",
         "bp_ip_14d",
+        "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
     ]
 
     if _MARKET_BLIND:
         _CTX = [c for c in _CTX if c not in _MARKET_FEATURES]
 
     def _add_elo(df_base, common, elo_by_p, target):
-        """Return (elo_diff, opponent_elo, ats_elo_diff, ats_opp_elo)."""
+        """Return (elo_diff, opponent_elo, ats_*, long_*)."""
         _nan = np.full(len(common), np.nan)
         elo_grp = elo_by_p.get(target)
         if elo_grp is None:
-            return _nan, _nan, _nan, _nan
+            return _nan, _nan, _nan, _nan, _nan, _nan
         ea = elo_grp.reindex(common)
         return (
             ea["elo_diff"].values,
             ea["opp_elo"].values,
             ea["ats_elo_diff"].values if "ats_elo_diff" in ea.columns else _nan,
             ea["ats_opp_elo"].values  if "ats_opp_elo"  in ea.columns else _nan,
+            ea["long_elo_diff"].values if "long_elo_diff" in ea.columns else _nan,
+            ea["long_opp_elo"].values  if "long_opp_elo"  in ea.columns else _nan,
         )
 
     for target in all_targets:
@@ -351,7 +398,8 @@ def _precompute(
                 for k in k_values:
                     df_k = base.copy()
                     (df_k["elo_diff"], df_k["opponent_elo"],
-                     df_k["ats_elo_diff"], df_k["ats_opp_elo"]) = _add_elo(
+                     df_k["ats_elo_diff"], df_k["ats_opp_elo"],
+                     df_k["long_elo_diff"], df_k["long_opp_elo"]) = _add_elo(
                         base, common, train_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
@@ -379,7 +427,8 @@ def _precompute(
                 for k in k_values:
                     df_k = base.copy()
                     (df_k["elo_diff"], df_k["opponent_elo"],
-                     df_k["ats_elo_diff"], df_k["ats_opp_elo"]) = _add_elo(
+                     df_k["ats_elo_diff"], df_k["ats_opp_elo"],
+                     df_k["long_elo_diff"], df_k["long_opp_elo"]) = _add_elo(
                         base, common, eval_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
@@ -690,6 +739,8 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     # _precompute and _CTX_COLS in _collect_window / build_upcoming_features,
     # none of which include them.
     _LABEL_COLS   = ["diff"]
+    # Derived from `diff` below; features, not labels.
+    _DIFF_FEATS   = ["1_ago_diff", "diff_mean_5", "win_streak", "loss_streak"]
 
     needed = {"team", "season", "period", "date", "home"}
     _matchup_cols = [
@@ -699,7 +750,7 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
         "ml_implied_prob",
         "bp_ip_14d",   # rolling N-day bullpen fatigue (seeded separately)
     ]
-    _all_out = ["home", "is_b2b"] + _CTX_FEAT + _matchup_cols + _LABEL_COLS
+    _all_out = ["home", "is_b2b"] + _CTX_FEAT + _matchup_cols + _DIFF_FEATS + _LABEL_COLS
 
     if not needed.issubset(games_df.columns):
         idx = pd.MultiIndex.from_frame(games_df[["team", "season", "period"]])
@@ -825,6 +876,28 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
         if _era_col in df.columns:
             df.loc[df[_era_col] > 10, _era_col] = np.nan
             df.loc[df[_era_col] == 0, _era_col] = np.nan
+
+    # --- Diff-based history: the market-free counterpart to the SpreadScore
+    # block. spreadscore = diff + spread, so the SS features carry the book's
+    # favourite/underdog call; these do not. Strictly pre-game: shift(1) before
+    # any window. Used by the win model in place of the SS features.
+    _dsrc = df.sort_values(["team", "season", "period"])
+    _g = _dsrc.groupby(["team", "season"])["diff"]
+    df["1_ago_diff"] = _g.shift(1).reindex(df.index)
+    df["diff_mean_5"] = (_g.transform(lambda x: x.shift(1).rolling(5, min_periods=2).mean())
+                         .reindex(df.index))
+
+    _w = np.zeros(len(_dsrc)); _l = np.zeros(len(_dsrc)); _i = 0
+    for _, _sub in _dsrc.groupby(["team", "season"], sort=False):
+        cw = cl = 0
+        for _v in pd.to_numeric(_sub["diff"], errors="coerce").shift(1):
+            _w[_i], _l[_i] = cw, cl
+            if pd.isna(_v):  cw = cl = 0
+            elif _v > 0:     cw, cl = cw + 1, 0
+            else:            cw, cl = 0, cl + 1
+            _i += 1
+    df["win_streak"] = pd.Series(_w, index=_dsrc.index).reindex(df.index)
+    df["loss_streak"] = pd.Series(_l, index=_dsrc.index).reindex(df.index)
 
     out_cols = [c for c in _all_out if c in df.columns]
     return df.set_index(["team", "season", "period"])[out_cols]
@@ -1120,6 +1193,7 @@ def _collect_window(
         "opp_bp_era", "opp_bp_whip", "bp_era_edge",
         "ml_implied_prob",
         "bp_ip_14d",
+        "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
     ]
     try:
         ctx_slice   = context.xs(target, level="period")
@@ -1140,12 +1214,16 @@ def _collect_window(
         df["elo_diff"]     = elo_aligned["elo_diff"].values
         df["opponent_elo"] = elo_aligned["opp_elo"].values
         for _src, _dst in (("ats_elo_diff", "ats_elo_diff"),
-                           ("ats_opp_elo", "ats_opp_elo")):
+                           ("ats_opp_elo", "ats_opp_elo"),
+                           ("long_elo_diff", "long_elo_diff"),
+                           ("long_opp_elo", "long_opp_elo")):
             df[_dst] = (elo_aligned[_src].values
                         if _src in elo_aligned.columns else np.nan)
     except KeyError:
         df["elo_diff"]     = np.nan
         df["opponent_elo"] = np.nan
+        df["long_elo_diff"] = np.nan
+        df["long_opp_elo"]  = np.nan
 
     _recast_categoricals(df)
     for col in df.columns:
@@ -1211,6 +1289,7 @@ def build_prediction_features(
         "opp_bp_era", "opp_bp_whip", "bp_era_edge",
         "ml_implied_prob",
         "bp_ip_14d",
+        "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
     ]
     if _MARKET_BLIND:
         _CTX_COLS = [c for c in _CTX_COLS if c not in _MARKET_FEATURES]
@@ -1228,7 +1307,9 @@ def build_prediction_features(
     # become NaN for every team.
     elo_df = elo_mod.compute(completed, k=best_k, window=_ELO_WINDOW)
     elo_df = _attach_ats_elo(elo_df, completed, best_k)
-    _elo_cols = ["elo", "opp_elo", "elo_diff", "ats_elo_diff", "ats_opp_elo"]
+    elo_df = _attach_long_elo(elo_df, completed, best_k)
+    _elo_cols = ["elo", "opp_elo", "elo_diff", "ats_elo_diff", "ats_opp_elo",
+                 "long_elo_diff", "long_opp_elo"]
     latest_elo = (
         elo_df.reset_index()
         .sort_values("period")
@@ -1242,6 +1323,10 @@ def build_prediction_features(
         if "ats_elo_diff" in latest_elo.columns else np.nan
     X["ats_opp_elo"]  = X["team"].map(latest_elo["ats_opp_elo"]) \
         if "ats_opp_elo" in latest_elo.columns else np.nan
+    X["long_elo_diff"] = X["team"].map(latest_elo["long_elo_diff"]) \
+        if "long_elo_diff" in latest_elo.columns else np.nan
+    X["long_opp_elo"]  = X["team"].map(latest_elo["long_opp_elo"]) \
+        if "long_opp_elo" in latest_elo.columns else np.nan
 
     # style_edge is not produced. It contributed nothing to the model, and
     # fitting the StyleModel here meant a full SVD of the season's matchup
@@ -1457,7 +1542,15 @@ def train_models(
         _win_params.update(_XGB_FIXED)
         _win_params["random_state"] = 42
         win_clf = XGBClassifier(**_win_params)
-        win_clf.fit(X_train[_m], w_train[_m])
+        # Fit WITHOUT the spreadscore-derived features -- see
+        # _SPREAD_DERIVED_FEATURES. The cover model keeps them (they are built
+        # for its target); the win model gets the diff-based equivalents that
+        # sit alongside them in the matrix. predict() reads win_clf's own
+        # feature_names, so the narrower column set flows through untouched.
+        _win_drop = [c for c in _SPREAD_DERIVED_FEATURES if c in X_train.columns]
+        print(f"  Win model excludes {len(_win_drop)} spreadscore-derived "
+              f"features: {_win_drop}")
+        win_clf.fit(X_train.drop(columns=_win_drop)[_m], w_train[_m])
 
         for split, X_s, w_s in (("test", X_test, win_labels.get("test")),
                                 ("val", X_val, win_labels.get("val"))):
@@ -1466,11 +1559,12 @@ def train_models(
             m = w_s.notna().values
             if m.sum() < 50:
                 continue
+            _Xs = X_s.drop(columns=[c for c in _win_drop if c in X_s.columns])
             try:
                 scores[f"win_{split}_roc"] = round(float(
-                    roc_auc_score(w_s[m], win_clf.predict_proba(X_s[m])[:, 1])), 3)
+                    roc_auc_score(w_s[m], win_clf.predict_proba(_Xs[m])[:, 1])), 3)
                 scores[f"win_{split}_acc"] = round(float(
-                    accuracy_score(w_s[m], win_clf.predict(X_s[m]))), 3)
+                    accuracy_score(w_s[m], win_clf.predict(_Xs[m]))), 3)
             except ValueError:
                 pass
     else:
@@ -1490,7 +1584,8 @@ def train_models(
         _all_w = pd.concat(all_w_parts, ignore_index=True)
         if len(_all_w) == len(_all_X):
             _m = _all_w.notna().values
-            win_clf.fit(_all_X[_m], _all_w[_m])
+            _wd = [c for c in _SPREAD_DERIVED_FEATURES if c in _all_X.columns]
+            win_clf.fit(_all_X.drop(columns=_wd)[_m], _all_w[_m])
 
     return clf, scores, best_lookback, best_k, style_model, win_clf
 
