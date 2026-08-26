@@ -109,6 +109,21 @@ _HYPEROPT_SPACE = {
 _MARKET_BLIND = True
 _MARKET_FEATURES = ("ml_implied_prob", "spread")
 
+# MLB bets the moneyline only -- predict_mlb sets bet="ML" unconditionally and
+# prices it from win_prob -- so the cover classifier is trained and saved for
+# nothing. Set False to skip fitting it; `coverprob` then comes back NaN and
+# callers fall back to the win model.
+#
+# Keep this True for a spread sport. The spreadscore pivot, the SS-derived
+# features and _SPREAD_DERIVED_FEATURES are all left in place precisely so the
+# cover target can be switched back on without rebuilding them.
+#
+# Note the hyperopt search still optimises the COVER label either way, and
+# win_clf inherits those hyperparameters. That is unchanged here deliberately,
+# so this flag alters what is fitted and not how anything is tuned; retuning on
+# the win label is a separate change worth measuring on its own.
+_TRAIN_COVER_MODEL = False
+
 # Features built on spreadscore ( = diff + spread ). The run line's sign is the
 # book's favourite/underdog call, so these carry market information even though
 # _MARKET_BLIND drops `spread` and `ml_implied_prob` as explicit columns. They
@@ -1410,40 +1425,45 @@ def train_models(
         print("    All key features OK.")
 
     print("  Tuning binary cover classifier...")
-    clf = XGBClassifier(
-        **_XGB_FIXED, random_state=42,
-        **_tune(XGBClassifier, X_train, y_train, max_evals, seed=seed)
-    )
-    clf.fit(X_train, y_train)
+    _tuned_params = {
+        **_XGB_FIXED, "random_state": 42,
+        **_tune(XGBClassifier, X_train, y_train, max_evals, seed=seed),
+    }
+    clf = XGBClassifier(**_tuned_params)
+    if _TRAIN_COVER_MODEL:
+        clf.fit(X_train, y_train)
+    else:
+        print("  _TRAIN_COVER_MODEL is False -- skipping the cover fit; "
+              "its tuned hyperparameters still carry to the win model.")
 
     # Evaluation metrics
     from sklearn.metrics import roc_auc_score, accuracy_score
-    train_acc = float(accuracy_score(y_train, clf.predict(X_train)))
-    try:
-        train_roc = float(roc_auc_score(y_train, clf.predict_proba(X_train)[:, 1]))
-    except ValueError:
-        train_roc = float("nan")
+    scores = {"lookback": best_lookback, "elo_k": best_k}
 
-    scores = {
-        "lookback":      best_lookback,
-        "elo_k":         best_k,
-        "clf_train_acc": round(train_acc, 3),
-        "clf_train_roc": round(train_roc, 3),
-    }
-    if not X_test.empty:
+    if _TRAIN_COVER_MODEL:
+        scores["clf_train_acc"] = round(
+            float(accuracy_score(y_train, clf.predict(X_train))), 3)
         try:
-            test_roc = float(roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1]))
-            scores["clf_test_roc"] = round(test_roc, 3)
-            scores["clf_test_acc"] = round(float(accuracy_score(y_test, clf.predict(X_test))), 3)
+            scores["clf_train_roc"] = round(
+                float(roc_auc_score(y_train, clf.predict_proba(X_train)[:, 1])), 3)
         except ValueError:
-            pass
-    if not X_val.empty:
-        try:
-            val_roc = float(roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1]))
-            scores["clf_val_roc"] = round(val_roc, 3)
-            scores["clf_val_acc"] = round(float(accuracy_score(y_val, clf.predict(X_val))), 3)
-        except ValueError:
-            pass
+            scores["clf_train_roc"] = float("nan")
+        if not X_test.empty:
+            try:
+                scores["clf_test_roc"] = round(float(
+                    roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1])), 3)
+                scores["clf_test_acc"] = round(float(
+                    accuracy_score(y_test, clf.predict(X_test))), 3)
+            except ValueError:
+                pass
+        if not X_val.empty:
+            try:
+                scores["clf_val_roc"] = round(float(
+                    roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1])), 3)
+                scores["clf_val_acc"] = round(float(
+                    accuracy_score(y_val, clf.predict(X_val))), 3)
+            except ValueError:
+                pass
 
     # --- Second target: P(win outright), for the moneyline market ---
     # Same features, different label. Trained on the rows where a win label
@@ -1457,7 +1477,7 @@ def train_models(
               f"with a derivable win label...")
         # get_xgb_params() already carries random_state and the fixed settings,
         # so merge rather than splatting both and colliding on duplicate keys.
-        _win_params = dict(clf.get_xgb_params())
+        _win_params = dict(_tuned_params)
         _win_params.update(_XGB_FIXED)
         _win_params["random_state"] = 42
         win_clf = XGBClassifier(**_win_params)
@@ -1494,7 +1514,8 @@ def train_models(
     all_X_parts = [X_train] + ([X_test] if not X_test.empty else []) + ([X_val] if not X_val.empty else [])
     all_y_parts = [y_train] + ([y_test] if not X_test.empty else []) + ([y_val] if not X_val.empty else [])
     _all_X = pd.concat(all_X_parts, ignore_index=True)
-    clf.fit(_all_X, pd.concat(all_y_parts, ignore_index=True))
+    if _TRAIN_COVER_MODEL:
+        clf.fit(_all_X, pd.concat(all_y_parts, ignore_index=True))
 
     if win_clf is not None:
         all_w_parts = [win_labels["train"]] \
@@ -1506,7 +1527,7 @@ def train_models(
             _wd = [c for c in _SPREAD_DERIVED_FEATURES if c in _all_X.columns]
             win_clf.fit(_all_X.drop(columns=_wd)[_m], _all_w[_m])
 
-    return clf, scores, best_lookback, best_k, style_model, win_clf
+    return (clf if _TRAIN_COVER_MODEL else None), scores, best_lookback,         best_k, style_model, win_clf
 
 
 # ---------------------------------------------------------------------------
@@ -1521,7 +1542,7 @@ _DEFAULT_MODEL_PATH = _os.path.join(_os.path.dirname(__file__), "data", "mlb_mod
 
 
 def save_model(
-    clf: XGBClassifier,
+    clf: "XGBClassifier | None",
     scores: dict,
     best_lookback: int,
     best_k: int | float,
@@ -1594,7 +1615,7 @@ def load_model(path: str = _DEFAULT_MODEL_PATH) -> dict:
 # ---------------------------------------------------------------------------
 
 def predict(
-    clf: XGBClassifier,
+    clf: "XGBClassifier | None",
     X_pred: pd.DataFrame,
     win_clf: "XGBClassifier | None" = None,
 ) -> pd.DataFrame:
@@ -1606,7 +1627,8 @@ def predict(
 
     Parameters
     ----------
-    clf     : fitted cover classifier (from train_models / load_model)
+    clf     : fitted cover classifier, or None when _TRAIN_COVER_MODEL is off
+              (MLB is moneyline-only). coverprob is NaN in that case.
     X_pred  : feature matrix with a `team` column (from build_prediction_features)
     win_clf : optional win classifier. Absent in bundles saved before the
               dual-target change, in which case win_prob is NaN and callers
@@ -1615,12 +1637,16 @@ def predict(
     Returns
     -------
     DataFrame indexed by team with columns:
-        coverprob : P(team covers the run line)
+        coverprob : P(team covers the run line), or NaN if no cover model
         win_prob  : P(team wins outright), or NaN if no win model
     """
-    feat_cols = clf.get_booster().feature_names
-    coverprob = clf.predict_proba(X_pred[feat_cols])[:, 1]
-    teams     = X_pred["team"].values
+    teams = X_pred["team"].values
+
+    if clf is not None:
+        feat_cols = clf.get_booster().feature_names
+        coverprob = clf.predict_proba(X_pred[feat_cols])[:, 1]
+    else:
+        coverprob = np.full(len(teams), np.nan)
 
     out = pd.DataFrame({"coverprob": coverprob}, index=teams)
 

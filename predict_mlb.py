@@ -1063,7 +1063,7 @@ def _run(
             "moneyline":       float(row["moneyline"])       if pd.notna(row.get("moneyline"))       else None,
             "ml_implied_prob": float(row["ml_implied_prob"]) if pd.notna(row.get("ml_implied_prob")) else None,
             "sp_name":         row.get("sp_name") or None,
-            "coverprob":       float(row["coverprob"]),
+            "coverprob":       float(row["coverprob"]) if pd.notna(row.get("coverprob")) else None,
             "win_prob":        float(row["win_prob"])  if pd.notna(row.get("win_prob"))        else None,
             "coverprob_diff":  row["coverprob_diff"]  if pd.notna(row.get("coverprob_diff"))  else None,
             "edge":            float(row["edge"])      if pd.notna(row.get("edge"))            else None,
