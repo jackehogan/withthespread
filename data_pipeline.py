@@ -1768,7 +1768,8 @@ def fetch_game_sp_stats(game_pk: str) -> dict[str, dict]:
 
     Returns
     -------
-    Dict mapping team name → {'sp_name': str, 'sp_ip_game': float, 'sp_er_game': int}
+    Dict mapping team name → {'sp_name', 'sp_ip_game', 'sp_er_game',
+    'sp_k_game', 'sp_bb_game', 'sp_h_game', 'sp_hr_game', 'sp_pitch_game'}
     Returns empty dict on failure.
     """
     try:
@@ -1855,10 +1856,25 @@ def fetch_game_sp_stats(game_pk: str) -> dict[str, dict]:
                 or starter.get("name", "")   # fallback to abbreviated name
             )
 
+            def _int(v) -> int:
+                try:
+                    return int(str(v).strip())
+                except (TypeError, ValueError):
+                    return 0
+
+            # k / bb / h / hr sit on the same summary row already being read, so
+            # these cost nothing beyond four dictionary lookups. They are what
+            # lets K/9, BB/9, WHIP and FIP be blended in-season instead of being
+            # frozen at their prior-season values.
             result[team_name] = {
-                "sp_name":    sp_name,
-                "sp_ip_game": round(_parse_ip(ip_val), 3),
-                "sp_er_game": int(er_val) if er_val is not None else 0,
+                "sp_name":       sp_name,
+                "sp_ip_game":    round(_parse_ip(ip_val), 3),
+                "sp_er_game":    int(er_val) if er_val is not None else 0,
+                "sp_k_game":     _int(starter.get("k")),
+                "sp_bb_game":    _int(starter.get("bb")),
+                "sp_h_game":     _int(starter.get("h")),
+                "sp_hr_game":    _int(starter.get("hr")),
+                "sp_pitch_game": _int(starter.get("p")),
             }
 
     return result

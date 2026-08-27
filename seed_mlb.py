@@ -495,14 +495,17 @@ def seed_mlb_sp_game_stats(season: int, request_delay: float = 0.25) -> None:
     try:
         col = client[db._MONGO_DB]["games"]
         pending = list(col.find(
+            # Keyed on sp_k_game, not sp_ip_game: rows seeded before the
+            # k/bb/h/hr extraction already have sp_ip_game and would otherwise
+            # be skipped forever.
             {"sport": "mlb", "season": season,
-             "sp_ip_game": {"$exists": False},
+             "sp_k_game": {"$exists": False},
              "game_pk": {"$exists": True, "$ne": ""}},
             {"_id": 0, "team": 1, "period": 1, "game_pk": 1},
         ))
 
         if not pending:
-            print("  All games already have sp_ip_game.")
+            print("  All games already have the per-game starter line.")
             return
 
         unique_pks = list(dict.fromkeys(r["game_pk"] for r in pending if r.get("game_pk")))
@@ -515,9 +518,13 @@ def seed_mlb_sp_game_stats(season: int, request_delay: float = 0.25) -> None:
             return
 
         ops = []
+        _INT_FIELDS = ["sp_er_game", "sp_k_game", "sp_bb_game",
+                       "sp_h_game", "sp_hr_game", "sp_pitch_game"]
         for _, row in sp_data.iterrows():
-            update = {"sp_ip_game": float(row["sp_ip_game"]),
-                      "sp_er_game": int(row["sp_er_game"])}
+            update = {"sp_ip_game": float(row["sp_ip_game"])}
+            for _f in _INT_FIELDS:
+                if _f in row and pd.notna(row[_f]):
+                    update[_f] = int(row[_f])
             ops.append(UpdateOne(
                 {"sport": "mlb", "season": season,
                  "team": row["team"], "game_pk": row["game_pk"]},
@@ -526,7 +533,8 @@ def seed_mlb_sp_game_stats(season: int, request_delay: float = 0.25) -> None:
             ))
         if ops:
             col.bulk_write(ops)
-            print(f"  Updated sp_ip_game/sp_er_game for {len(ops)} game rows.")
+            print(f"  Updated the per-game starter line "
+                  f"(ip/er/k/bb/h/hr/pitches) for {len(ops)} game rows.")
     finally:
         client.close()
 
