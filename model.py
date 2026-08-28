@@ -58,7 +58,18 @@ _LOOKBACK_CANDIDATES     = [7, 10, 15]
 # realised-vs-claimed slope ratio -- both landed on 6. The list is kept at
 # length one so the surrounding search plumbing and the saved bundle format
 # stay unchanged. See elo.py for the derivation.
-_K_CANDIDATES            = [6.0]
+_K_CANDIDATES            = [16.0]
+# Second Elo at a faster K, giving the tree two memory horizons instead of one.
+# The pre-rebuild model carried two (window 20 and window 40) and scored
+# win_val_roc 0.615; collapsing to a single rating dropped it to 0.562. This is
+# the ablation for whether the second horizon was what mattered. K=24 half-lives
+# in roughly 20 games against K=6's 80. Set to None to disable.
+_FAST_ELO_K              = 24.0
+# EXPERIMENT ONLY (branch elo-revert-test): reproduce the pre-rebuild Elo
+# feature set exactly -- elo_diff at the league-wide window 20, plus a second
+# rating at window 40 standing in for long_elo_diff/long_opp_elo -- to test
+# whether reverting the rating recovers win_val_roc 0.615.
+_REVERT_TEST_WINDOW      = 40
 _BP_FATIGUE_DAYS         = 14    # fixed rolling window for bp_ip_14d — not a hyperparameter
 
 # style_edge is not fed to the model. Measured on the 2025 hold-out it scored
@@ -233,6 +244,11 @@ def _precompute(
     eval_elo_by_k  = {}
     for k in k_values:
         er = elo_mod.compute(games_df, k=k)
+        if _FAST_ELO_K is not None:
+            _fast = elo_mod.compute(games_df, k=k, window=_REVERT_TEST_WINDOW)
+            er = er.join(_fast[["elo_diff", "opp_elo"]]
+                         .rename(columns={"elo_diff": "fast_elo_diff",
+                                          "opp_elo": "fast_opp_elo"}))
         elo_by_k[k]       = er
         _eval_mask = er.index.get_level_values("season") == eval_season
         train_elo_by_k[k] = er[~_eval_mask]
@@ -322,19 +338,24 @@ def _precompute(
         "ml_implied_prob",
         "bp_ip_14d",
         "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
-    ]
+    ] + ["sp_whip_edge","sp_k9_edge","sp_ip_per_start_edge","bp_whip_edge","bp_k9_edge","bp_hr9_edge","bp_ip_per_game_edge","1_ago_diff_edge","diff_mean_5_edge","win_streak_edge","loss_streak_edge"]
 
     if _MARKET_BLIND:
         _CTX = [c for c in _CTX if c not in _MARKET_FEATURES]
 
     def _add_elo(df_base, common, elo_by_p, target):
-        """Return (elo_diff, opponent_elo)."""
+        """Return (elo_diff, opponent_elo, fast_elo_diff, fast_opp_elo)."""
         _nan = np.full(len(common), np.nan)
         elo_grp = elo_by_p.get(target)
         if elo_grp is None:
-            return _nan, _nan
+            return _nan, _nan, _nan, _nan
         ea = elo_grp.reindex(common)
-        return ea["elo_diff"].values, ea["opp_elo"].values
+        return (
+            ea["elo_diff"].values,
+            ea["opp_elo"].values,
+            ea["fast_elo_diff"].values if "fast_elo_diff" in ea.columns else _nan,
+            ea["fast_opp_elo"].values if "fast_opp_elo" in ea.columns else _nan,
+        )
 
     for target in all_targets:
         # --- train split ---
@@ -356,7 +377,8 @@ def _precompute(
                 y_cov_tr, y_win_tr = _cover_and_win_labels(y_tr, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
-                    (df_k["elo_diff"], df_k["opponent_elo"]) = _add_elo(
+                    (df_k["elo_diff"], df_k["opponent_elo"],
+                     df_k["fast_elo_diff"], df_k["fast_opp_elo"]) = _add_elo(
                         base, common, train_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
@@ -383,7 +405,8 @@ def _precompute(
                 y_cov_ev, y_win_ev = _cover_and_win_labels(y_ev, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
-                    (df_k["elo_diff"], df_k["opponent_elo"]) = _add_elo(
+                    (df_k["elo_diff"], df_k["opponent_elo"],
+                     df_k["fast_elo_diff"], df_k["fast_opp_elo"]) = _add_elo(
                         base, common, eval_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
@@ -533,6 +556,11 @@ def build_features(
         eval_ctx  = context[context.index.get_level_values("season") == eval_season]
 
         elo_ratings = elo_mod.compute(games_df, k=best_k)
+        if _FAST_ELO_K is not None:
+            _f = elo_mod.compute(games_df, k=best_k, window=_REVERT_TEST_WINDOW)
+            elo_ratings = elo_ratings.join(
+                _f[["elo_diff", "opp_elo"]].rename(
+                    columns={"elo_diff": "fast_elo_diff", "opp_elo": "fast_opp_elo"}))
         train_elo   = elo_ratings[
             ~elo_ratings.index.get_level_values("season").isin([eval_season])
         ]
@@ -697,13 +725,26 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     _DIFF_FEATS   = ["1_ago_diff", "diff_mean_5", "win_streak", "loss_streak"]
 
     needed = {"team", "season", "period", "date", "home"}
+    # Every feature gets a matchup edge. Measured over 11,593 paired games, the
+    # edge beat the own-side value in 14 of 14 features tested -- unanimously,
+    # by +0.0000 (sp_ip_per_start) to +0.0277 (elo). A baseball game is a
+    # contest: our bullpen's 3.50 ERA means nothing without theirs. Only three
+    # edges existed before this (sp_era, bp_era, elo), and the four form
+    # features had no opponent counterpart at all, which is why elo_diff was
+    # carrying the opponent's recent form single-handedly.
+    _EDGE_COLS = [
+        "sp_whip_edge", "sp_k9_edge", "sp_ip_per_start_edge",
+        "bp_whip_edge", "bp_k9_edge", "bp_hr9_edge", "bp_ip_per_game_edge",
+        "1_ago_diff_edge", "diff_mean_5_edge",
+        "win_streak_edge", "loss_streak_edge",
+    ]
     _matchup_cols = [
         "opp_sp_era", "opp_sp_whip", "sp_era_edge",
         "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
         "opp_bp_era", "opp_bp_whip", "bp_era_edge",
         "ml_implied_prob",
         "bp_ip_14d",   # rolling N-day bullpen fatigue (seeded separately)
-    ]
+    ] + _EDGE_COLS
     _all_out = ["home", "is_b2b"] + _CTX_FEAT + _matchup_cols + _DIFF_FEATS + _LABEL_COLS
 
     if not needed.issubset(games_df.columns):
@@ -731,8 +772,10 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
 
     # --- Opponent matchup features ---
     # Build a lookup: (team, season, period) -> sp_era, sp_whip, bp_era, bp_whip
-    pitchers_have = [c for c in ["sp_era", "sp_whip"] if c in df.columns]
-    bullpen_have  = [c for c in ["bp_era", "bp_whip"] if c in df.columns]
+    pitchers_have = [c for c in ["sp_era", "sp_whip", "sp_k9", "sp_ip_per_start"]
+                     if c in df.columns]
+    bullpen_have  = [c for c in ["bp_era", "bp_whip", "bp_k9", "bp_hr9",
+                                 "bp_ip_per_game"] if c in df.columns]
     lookup_cols   = pitchers_have + bullpen_have
 
     if opp_present and lookup_cols:
@@ -754,6 +797,24 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
             df["bp_era_edge"] = df["opp_bp_era"] - df["bp_era"]   # positive = our bullpen is better
         if "bp_whip" in bullpen_have:
             df["opp_bp_whip"] = opp_vals["bp_whip"].values
+
+        # Remaining stat edges. Sign is always "positive favours us", so rate
+        # stats where lower is better (WHIP, HR/9) subtract ours from theirs.
+        _EDGE_SPEC = [
+            ("sp_whip_edge",        "sp_whip",        -1),
+            ("sp_k9_edge",          "sp_k9",          +1),
+            ("sp_ip_per_start_edge","sp_ip_per_start",+1),
+            ("bp_whip_edge",        "bp_whip",        -1),
+            ("bp_k9_edge",          "bp_k9",          +1),
+            ("bp_hr9_edge",         "bp_hr9",         -1),
+            ("bp_ip_per_game_edge", "bp_ip_per_game", +1),
+        ]
+        for _name, _col, _sign in _EDGE_SPEC:
+            if _col in lookup_cols:
+                _opp = opp_vals[_col].values
+                df[_name] = ((df[_col] - _opp) if _sign > 0 else (_opp - df[_col]))
+            else:
+                df[_name] = np.nan
     else:
         for c in _matchup_cols:
             df[c] = np.nan
@@ -852,6 +913,30 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
             _i += 1
     df["win_streak"] = pd.Series(_w, index=_dsrc.index).reindex(df.index)
     df["loss_streak"] = pd.Series(_l, index=_dsrc.index).reindex(df.index)
+
+    # --- Form edges ---
+    # These four had NO opponent counterpart, so the tree could not compare
+    # recent form at all. That gap is why elo_diff mattered so much: the
+    # league-window Elo was a differenced recent-form signal (correlation 0.784
+    # with own-minus-opponent last-game margin) and the only feature carrying
+    # the opponent's side of it. Built here rather than in the matchup block
+    # above because the source columns do not exist until now.
+    _FORM_EDGES = [("1_ago_diff_edge",  "1_ago_diff",  +1),
+                   ("diff_mean_5_edge", "diff_mean_5", +1),
+                   ("win_streak_edge",  "win_streak",  +1),
+                   ("loss_streak_edge", "loss_streak", -1)]
+    if opp_present:
+        _form_lookup = df.set_index(["team", "season", "period"])[
+            [c for _, c, _s in _FORM_EDGES]]
+        _fk = list(zip(df["opponent"], df["season"], df["period"]))
+        _fv = _form_lookup.reindex(_fk)
+        _fv.index = df.index
+        for _name, _col, _sign in _FORM_EDGES:
+            _opp = _fv[_col].values
+            df[_name] = ((df[_col] - _opp) if _sign > 0 else (_opp - df[_col]))
+    else:
+        for _name, _col, _sign in _FORM_EDGES:
+            df[_name] = np.nan
 
     out_cols = [c for c in _all_out if c in df.columns]
     return df.set_index(["team", "season", "period"])[out_cols]
@@ -1148,7 +1233,7 @@ def _collect_window(
         "ml_implied_prob",
         "bp_ip_14d",
         "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
-    ]
+    ] + ["sp_whip_edge","sp_k9_edge","sp_ip_per_start_edge","bp_whip_edge","bp_k9_edge","bp_hr9_edge","bp_ip_per_game_edge","1_ago_diff_edge","diff_mean_5_edge","win_streak_edge","loss_streak_edge"]
     try:
         ctx_slice   = context.xs(target, level="period")
         ctx_aligned = ctx_slice.reindex(common_idx)
@@ -1167,9 +1252,14 @@ def _collect_window(
         elo_aligned  = elo_slice.reindex(common_idx)
         df["elo_diff"]     = elo_aligned["elo_diff"].values
         df["opponent_elo"] = elo_aligned["opp_elo"].values
+        for _c in ("fast_elo_diff", "fast_opp_elo"):
+            df[_c] = (elo_aligned[_c].values
+                      if _c in elo_aligned.columns else np.nan)
     except KeyError:
         df["elo_diff"]     = np.nan
         df["opponent_elo"] = np.nan
+        df["fast_elo_diff"] = np.nan
+        df["fast_opp_elo"]  = np.nan
 
     _recast_categoricals(df)
     for col in df.columns:
@@ -1236,7 +1326,7 @@ def build_prediction_features(
         "ml_implied_prob",
         "bp_ip_14d",
         "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
-    ]
+    ] + ["sp_whip_edge","sp_k9_edge","sp_ip_per_start_edge","bp_whip_edge","bp_k9_edge","bp_hr9_edge","bp_ip_per_game_edge","1_ago_diff_edge","diff_mean_5_edge","win_streak_edge","loss_streak_edge"]
     if _MARKET_BLIND:
         _CTX_COLS = [c for c in _CTX_COLS if c not in _MARKET_FEATURES]
 
@@ -1251,7 +1341,11 @@ def build_prediction_features(
     # Must mirror _precompute exactly — a column present in training but missing
     # here would silently become NaN for every team.
     elo_df = elo_mod.compute(completed, k=best_k)
-    _elo_cols = ["elo", "opp_elo", "elo_diff"]
+    if _FAST_ELO_K is not None:
+        _f = elo_mod.compute(completed, k=best_k, window=_REVERT_TEST_WINDOW)
+        elo_df = elo_df.join(_f[["elo_diff", "opp_elo"]].rename(
+            columns={"elo_diff": "fast_elo_diff", "opp_elo": "fast_opp_elo"}))
+    _elo_cols = ["elo", "opp_elo", "elo_diff", "fast_elo_diff", "fast_opp_elo"]
     latest_elo = (
         elo_df.reset_index()
         .sort_values("period")
@@ -1261,6 +1355,9 @@ def build_prediction_features(
     )
     X["elo_diff"]     = X["team"].map(latest_elo["elo_diff"])
     X["opponent_elo"] = X["team"].map(latest_elo["opp_elo"])
+    for _c in ("fast_elo_diff", "fast_opp_elo"):
+        X[_c] = (X["team"].map(latest_elo[_c])
+                 if _c in latest_elo.columns else np.nan)
 
     # style_edge is not produced. It contributed nothing to the model, and
     # fitting the StyleModel here meant a full SVD of the season's matchup
