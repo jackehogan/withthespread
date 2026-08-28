@@ -1867,6 +1867,13 @@ def fetch_game_sp_stats(game_pk: str) -> dict[str, dict]:
             # lets K/9, BB/9, WHIP and FIP be blended in-season instead of being
             # frozen at their prior-season values.
             result[team_name] = {
+                # `is_home` lets callers key the update on (game_pk, home)
+                # instead of the team name. Name matching silently dropped every
+                # Oakland Athletics game in 2022-2024: the boxscore resolves OAK
+                # to "Athletics" while those rows are stored as "Oakland
+                # Athletics", so the update filter matched nothing and wrote
+                # nothing, with no error raised.
+                "is_home":       1 if side == "home" else 0,
                 "sp_name":       sp_name,
                 "sp_ip_game":    round(_parse_ip(ip_val), 3),
                 "sp_er_game":    int(er_val) if er_val is not None else 0,

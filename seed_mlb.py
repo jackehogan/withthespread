@@ -468,7 +468,12 @@ def seed_mlb_bp_fatigue(season: int, request_delay: float = 0.25) -> None:
                 upsert=False,
             ))
         if ops:
-            col.bulk_write(ops)
+            _res = col.bulk_write(ops)
+            _matched = getattr(_res, "matched_count", None)
+            if _matched is not None and _matched < len(ops):
+                print(f"  WARNING: {len(ops) - _matched} of {len(ops)} updates "
+                      f"matched no row. That is a key mismatch, not a fetch "
+                      f"failure -- check team naming for this season.")
             print(f"  Updated bp_ip_game for {len(ops)} game rows.")
     finally:
         client.close()
@@ -525,12 +530,16 @@ def seed_mlb_sp_game_stats(season: int, request_delay: float = 0.25) -> None:
             for _f in _INT_FIELDS:
                 if _f in row and pd.notna(row[_f]):
                     update[_f] = int(row[_f])
-            ops.append(UpdateOne(
-                {"sport": "mlb", "season": season,
-                 "team": row["team"], "game_pk": row["game_pk"]},
-                {"$set": update},
-                upsert=False,
-            ))
+            # Key on (game_pk, home), not the team name -- see the note in
+            # fetch_game_sp_stats. Name matching is fragile across franchise
+            # renames and fails silently.
+            if "is_home" in row and pd.notna(row["is_home"]):
+                _filter = {"sport": "mlb", "season": season,
+                           "game_pk": row["game_pk"], "home": int(row["is_home"])}
+            else:
+                _filter = {"sport": "mlb", "season": season,
+                           "team": row["team"], "game_pk": row["game_pk"]}
+            ops.append(UpdateOne(_filter, {"$set": update}, upsert=False))
         if ops:
             col.bulk_write(ops)
             print(f"  Updated the per-game starter line "
