@@ -1143,17 +1143,21 @@ def _run(
     # Enforce p(A) + p(B) = 1 across the two sides of a game
     # ------------------------------------------------------------------
     # The model scores each team independently and nothing constrains it to
-    # treat one game consistently from both sides. Measured over 2313 held-out
-    # 2025 games the two win probabilities summed to between 0.609 and 1.366,
-    # with 54% of games off by more than 0.05 -- that incoherence is what
-    # produced moneyline EVs above +1.00.
+    # treat one game consistently from both sides. On 2026 the two win
+    # probabilities summed to between 0.557 and 1.401, with 57% of games off
+    # by more than 0.05 -- that incoherence is what produced EVs above +1.00.
     #
     # Splitting the discrepancy evenly projects onto the space where the pair
-    # is coherent, and it is strictly better on every metric over those games:
-    #   AUC      0.6969 -> 0.7193
-    #   log loss 0.6370 -> 0.6321
-    #   Brier    0.2230 -> 0.2205
-    # Rows with p > 0.70 fall from 235 to 163, which is the inflated tail.
+    # is coherent, and improves every metric on 2026 (3720 rows), which is the
+    # only season never used for fitting OR hyperparameter selection:
+    #   AUC      0.5995 -> 0.6121
+    #   log loss 0.6800 -> 0.6736
+    #   Brier    0.2434 -> 0.2404
+    #
+    # Measure changes on 2026, not 2025: train_mlb.EVAL_SEASON = 2025, so
+    # lookback, Elo K and the hyperopt search are all selected on 2025. The
+    # same comparison there reads 0.6969 -> 0.7193, and that 0.72 is selection
+    # bias, not skill -- the honest out-of-sample AUC is 0.61.
     if "opponent" in preds.columns and "win_prob" in preds.columns:
         if preds.index.has_duplicates:
             # Doubleheaders would mis-pair a team with the wrong game.
