@@ -1832,12 +1832,14 @@ def fetch_game_sp_stats(game_pk: str) -> dict[str, dict]:
         # Find the starter: first pitcher who threw > 2 IP.
         # If first threw ≤ 2 IP (opener), skip them and take the next.
         starter = None
+        starter_i = None
         for i, p in enumerate(real):
             ip_val = p.get("ip") or p.get("inningsPitched") or "0"
             ip = _parse_ip(ip_val)
             if i == 0 and ip <= 2.0:
                 continue  # opener — skip, true starter follows
             starter = p
+            starter_i = i
             break
 
         if starter and team_name:
@@ -1866,6 +1868,24 @@ def fetch_game_sp_stats(game_pk: str) -> dict[str, dict]:
             # these cost nothing beyond four dictionary lookups. They are what
             # lets K/9, BB/9, WHIP and FIP be blended in-season instead of being
             # frozen at their prior-season values.
+            # Bullpen = every pitcher who appeared except the identified
+            # starter, so a relief opener counts as bullpen (matching
+            # fetch_game_bp_ip). These are the only per-game bullpen numbers
+            # available anywhere; bp_era/bp_whip/bp_k9 are season-constant
+            # prior-year team values and cannot describe tonight's bullpen.
+            _pen = [q for j, q in enumerate(real) if j != starter_i]
+            _pen_ip = sum(_parse_ip(q.get("ip") or q.get("inningsPitched") or "0")
+                          for q in _pen)
+
+            def _isum(key) -> int:
+                tot = 0
+                for q in _pen:
+                    try:
+                        tot += int(str(q.get(key, 0)).strip())
+                    except (TypeError, ValueError):
+                        pass
+                return tot
+
             result[team_name] = {
                 # `is_home` lets callers key the update on (game_pk, home)
                 # instead of the team name. Name matching silently dropped every
@@ -1882,6 +1902,14 @@ def fetch_game_sp_stats(game_pk: str) -> dict[str, dict]:
                 "sp_h_game":     _int(starter.get("h")),
                 "sp_hr_game":    _int(starter.get("hr")),
                 "sp_pitch_game": _int(starter.get("p")),
+                "bp_ip_game":     round(_pen_ip, 3),
+                "bp_er_game":     _isum("er"),
+                "bp_k_game":      _isum("k"),
+                "bp_bb_game":     _isum("bb"),
+                "bp_h_game":      _isum("h"),
+                "bp_hr_game":     _isum("hr"),
+                "bp_pitch_game":  _isum("p"),
+                "bp_n_relievers": len(_pen),
             }
 
     return result

@@ -504,7 +504,7 @@ def seed_mlb_sp_game_stats(season: int, request_delay: float = 0.25) -> None:
             # k/bb/h/hr extraction already have sp_ip_game and would otherwise
             # be skipped forever.
             {"sport": "mlb", "season": season,
-             "sp_k_game": {"$exists": False},
+             "bp_k_game": {"$exists": False},
              "game_pk": {"$exists": True, "$ne": ""}},
             {"_id": 0, "team": 1, "period": 1, "game_pk": 1},
         ))
@@ -524,9 +524,14 @@ def seed_mlb_sp_game_stats(season: int, request_delay: float = 0.25) -> None:
 
         ops = []
         _INT_FIELDS = ["sp_er_game", "sp_k_game", "sp_bb_game",
-                       "sp_h_game", "sp_hr_game", "sp_pitch_game"]
+                       "sp_h_game", "sp_hr_game", "sp_pitch_game",
+                       "bp_er_game", "bp_k_game", "bp_bb_game",
+                       "bp_h_game", "bp_hr_game", "bp_pitch_game",
+                       "bp_n_relievers"]
         for _, row in sp_data.iterrows():
             update = {"sp_ip_game": float(row["sp_ip_game"])}
+            if "bp_ip_game" in row and pd.notna(row["bp_ip_game"]):
+                update["bp_ip_game"] = float(row["bp_ip_game"])
             for _f in _INT_FIELDS:
                 if _f in row and pd.notna(row[_f]):
                     update[_f] = int(row[_f])
