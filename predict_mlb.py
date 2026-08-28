@@ -256,6 +256,11 @@ def fetch_upcoming_mlb_games(target_date: str) -> pd.DataFrame:
     -------
     DataFrame with columns: game_date, home_team, away_team, home_sp, away_sp
     """
+    # The Eastern-date check below compares against this value as a string; a
+    # date/Timestamp would make every comparison unequal and silently drop the
+    # entire slate.
+    target_date = str(target_date)[:10]
+
     try:
         import statsapi
     except ImportError:
@@ -463,18 +468,29 @@ def build_upcoming_context_mlb(
                 ml_odds    = row.get("moneyline",    np.nan)  # h2h win/lose odds (ML EV)
                 over_under = row.get("total",        np.nan)
 
-            # Starting pitcher stats (prior season)
-            sp_era = sp_whip = sp_k9 = np.nan
-            if sp_name and not pitcher_stats.empty and sp_name in pitcher_stats.index:
-                p = pitcher_stats.loc[sp_name]
+            # Starting pitcher stats (prior season).
+            # pitcher_stats is indexed by name_key -- accent-stripped and
+            # lowercased by dp._normalize_pitcher_name. Looking up the raw
+            # schedule name matched NOTHING (0 of 28 starters), so sp_era,
+            # sp_whip and sp_k9 were NaN for every prediction.
+            sp_era = sp_whip = sp_k9 = sp_ip_per_start = np.nan
+            _key = dp._normalize_pitcher_name(sp_name) if sp_name else ""
+            if _key and not pitcher_stats.empty and _key in pitcher_stats.index:
+                p = pitcher_stats.loc[_key]
+                if isinstance(p, pd.DataFrame):
+                    p = p.iloc[0]
                 sp_era  = float(p["era"])  if pd.notna(p.get("era"))  else np.nan
                 sp_whip = float(p["whip"]) if pd.notna(p.get("whip")) else np.nan
                 sp_k9   = float(p["k9"])   if pd.notna(p.get("k9"))   else np.nan
+                sp_ip_per_start = (float(p["ip_per_start"])
+                                   if pd.notna(p.get("ip_per_start")) else np.nan)
 
             # Bullpen stats (prior season, team-level)
-            bp_era = bp_whip = bp_k9 = bp_hr9 = np.nan
+            bp_era = bp_whip = bp_k9 = bp_hr9 = bp_ip_per_game = np.nan
             if not bullpen_stats.empty and team in bullpen_stats.index:
                 b = bullpen_stats.loc[team]
+                bp_ip_per_game = (float(b["bp_ip_per_game"])
+                                  if pd.notna(b.get("bp_ip_per_game")) else np.nan)
                 bp_era  = float(b["bp_era"])  if pd.notna(b.get("bp_era"))  else np.nan
                 bp_whip = float(b["bp_whip"]) if pd.notna(b.get("bp_whip")) else np.nan
                 bp_k9   = float(b["bp_k9"])   if pd.notna(b.get("bp_k9"))   else np.nan
@@ -496,7 +512,9 @@ def build_upcoming_context_mlb(
                 "sp_era":      sp_era,
                 "sp_whip":     sp_whip,
                 "sp_k9":       sp_k9,
+                "sp_ip_per_start": sp_ip_per_start,
                 "bp_era":      bp_era,
+                "bp_ip_per_game": bp_ip_per_game,
                 "bp_whip":     bp_whip,
                 "bp_k9":       bp_k9,
                 "bp_hr9":      bp_hr9,
@@ -536,6 +554,124 @@ def build_upcoming_context_mlb(
             ctx["opp_bp_whip"] = [_opp(t, "bp_whip") for t in ctx.index]
             ctx["bp_era_edge"] = ctx["opp_bp_era"].astype(float) - ctx["bp_era"].astype(float)
 
+    # --- Own-side features computed from completed games ---------------------
+    # model.py's _compute_context builds these for TRAINING. This function is a
+    # separate implementation used only at PREDICTION time, and the two had
+    # drifted: 22 of 46 model features arrived as all-NaN, which XGBoost happily
+    # accepts, so the failure was silent and produced nonsense probabilities
+    # (mean win_prob 0.395 against a training base rate of 0.500). Anything
+    # added to _compute_context must be mirrored here until the duplication is
+    # removed. The fill guard in _run is the backstop.
+    ctx = _attach_history_features(ctx, season_games)
+
+    # --- Opponent mirrors ----------------------------------------------------
+    # Both sides of every game are rows in ctx, so mapping through `opponent`
+    # gives the opponent's value for THIS game -- the same game_pk keying the
+    # training path uses.
+    if "opponent" in ctx.columns:
+        # Drive off the live matchup set so this cannot drift when features
+        # move between _OPP_FEATURES and the bullpen switch.
+        # The switchable set, plus the mirrors that live in _matchup_cols and
+        # are therefore always expected regardless of _MATCHUP_MODE.
+        _want = set(ml._matchup_extra_features()) | {
+            "opp_sp_era_rolling", "opp_sp_era", "opp_sp_whip",
+            "opp_bp_era", "opp_bp_whip"}
+        _MIRROR = [c for c in ctx.columns if ("opp_" + c) in _want]
+        for _c in _MIRROR:
+            tgt = "opp_" + _c
+            if tgt in ctx.columns:
+                continue
+            ctx[tgt] = ctx["opponent"].map(
+                lambda o, col=_c: ctx.loc[o, col] if o in ctx.index else np.nan)
+
+    return ctx
+
+
+def _attach_history_features(ctx: pd.DataFrame,
+                             season_games: pd.DataFrame) -> pd.DataFrame:
+    """
+    Form and rolling-bullpen features for the upcoming game, from completed
+    games only. Mirrors what model._compute_context builds for training.
+    """
+    if season_games is None or season_games.empty:
+        return ctx
+    g = season_games.copy()
+    g["date"] = pd.to_datetime(g["date"], errors="coerce")
+    for c in ("diff", "bp_ip_game", "bp_er_game", "bp_bb_game",
+              "bp_h_game", "bp_k_game", "bp_pitch_game"):
+        if c in g.columns:
+            g[c] = pd.to_numeric(g[c], errors="coerce")
+    g = g.sort_values(["team", "date"])
+
+    # form: last game, mean of last 5, current win/loss streak
+    form = {}
+    for team, grp in g.dropna(subset=["diff"]).groupby("team"):
+        d = grp["diff"].to_numpy()
+        w = l = 0
+        for v in d[::-1]:
+            if v > 0 and l == 0: w += 1
+            elif v < 0 and w == 0: l += 1
+            else: break
+        form[team] = {"1_ago_diff": d[-1] if len(d) else np.nan,
+                      "diff_mean_5": d[-5:].mean() if len(d) else np.nan,
+                      "win_streak": float(w), "loss_streak": float(l)}
+    for col in ("1_ago_diff", "diff_mean_5", "win_streak", "loss_streak"):
+        ctx[col] = [form.get(t, {}).get(col, np.nan) for t in ctx.index]
+
+    # bullpen: 30-day pitch load, and lambda-shrunk in-season rates
+    if "bp_pitch_game" in g.columns:
+        cutoff = g["date"].max() - pd.Timedelta(days=ml._BP_WORKLOAD_DAYS)
+        load = g[g["date"] > cutoff].groupby("team")["bp_pitch_game"].sum().to_dict()
+        ctx["bp_pitch_30d"] = [load.get(t, np.nan) for t in ctx.index]
+
+    _SPEC = {"era": (["bp_er_game"], 9.0, "bp_era"),
+             "whip": (["bp_bb_game", "bp_h_game"], 1.0, "bp_whip"),
+             "k9": (["bp_k_game"], 9.0, "bp_k9")}
+    # sp_era_rolling: this starter's own in-season ERA shrunk toward his
+    # prior-season number, the same lambda blend model.py uses for training.
+    if {"sp_name", "sp_ip_game", "sp_er_game"} <= set(g.columns):
+        g["sp_ip_game"] = pd.to_numeric(g["sp_ip_game"], errors="coerce")
+        g["sp_er_game"] = pd.to_numeric(g["sp_er_game"], errors="coerce")
+        agg = (g.dropna(subset=["sp_name"])
+                 .groupby("sp_name")[["sp_ip_game", "sp_er_game"]].sum())
+        lam = ml._SP_ERA_BLEND_LAMBDA
+        vals = {}
+        for team in ctx.index:
+            nm = ctx.loc[team, "sp_name"] if "sp_name" in ctx.columns else None
+            prior = ctx.loc[team, "sp_era"] if "sp_era" in ctx.columns else np.nan
+            prior = float(prior) if pd.notna(prior) else np.nan
+            std = np.nan
+            if nm and nm in agg.index:
+                ip = float(agg.loc[nm, "sp_ip_game"])
+                er = float(agg.loc[nm, "sp_er_game"])
+                if ip > 0:
+                    std = er * 9.0 / ip
+            if not np.isfinite(std):     vals[team] = prior
+            elif not np.isfinite(prior): vals[team] = std
+            else:
+                w = float(agg.loc[nm, "sp_ip_game"])
+                w = w / (w + lam)
+                vals[team] = w * std + (1 - w) * prior
+        ctx["sp_era_rolling"] = [vals.get(t, np.nan) for t in ctx.index]
+
+    for rate, (nums, mult, prior_col) in _SPEC.items():
+        if not set(nums) <= set(g.columns) or "bp_ip_game" not in g.columns:
+            continue
+        lam = ml._BP_RATE_LAMBDA[rate]
+        vals = {}
+        for team, grp in g.groupby("team"):
+            ip = grp["bp_ip_game"].sum(skipna=True)
+            num = grp[nums].sum(axis=1, skipna=False).sum(skipna=True)
+            std = (num * mult / ip) if ip > 0 else np.nan
+            prior = ctx.loc[team, prior_col] if (team in ctx.index
+                    and prior_col in ctx.columns) else np.nan
+            prior = float(prior) if pd.notna(prior) else np.nan
+            if not np.isfinite(std):      vals[team] = prior
+            elif not np.isfinite(prior):  vals[team] = std
+            else:
+                wgt = ip / (ip + lam)
+                vals[team] = wgt * std + (1 - wgt) * prior
+        ctx[f"bp_{rate}_rolling"] = [vals.get(t, np.nan) for t in ctx.index]
     return ctx
 
 
@@ -930,6 +1066,15 @@ def _run(
             print(f"  bp_ip_14d (fatigue, {ml._BP_FATIGUE_DAYS}d) populated for "
                   f"{n_filled}/{len(upcoming_context)} teams.")
 
+    # bp_ip_14d and is_b2b are filled after the context is assembled, so their
+    # opponent mirrors have to be taken here rather than inside the builder.
+    if not upcoming_context.empty and "opponent" in upcoming_context.columns:
+        for _c in ("bp_ip_14d", "is_b2b"):
+            if _c in upcoming_context.columns:
+                upcoming_context["opp_" + _c] = upcoming_context["opponent"].map(
+                    lambda o, col=_c: upcoming_context.loc[o, col]
+                    if o in upcoming_context.index else np.nan)
+
     # ------------------------------------------------------------------
     # 5. Predict
     # ------------------------------------------------------------------
@@ -949,6 +1094,41 @@ def _run(
         print("  Not enough season data to generate predictions.")
         return pd.DataFrame()
 
+    # --- Feature fill guard --------------------------------------------------
+    # Training and prediction build features through two separate code paths
+    # (model._compute_context vs build_upcoming_context_mlb). When they drift, a
+    # feature the model was trained on arrives as all-NaN. XGBoost accepts NaN
+    # silently, so the run "succeeds" and emits nonsense -- that is exactly how
+    # 22 of 46 features went missing and produced a mean win_prob of 0.395
+    # against a 0.500 base rate, with one pick priced at +0.80 EV.
+    #
+    # Fail loudly instead. A feature the model actually splits on must not be
+    # mostly empty at prediction time.
+    _wc = _bundle.get("win_clf")
+    if _wc is not None:
+        _need = list(_wc.get_booster().feature_names)
+        _empty, _sparse = [], []
+        for _f in _need:
+            if _f not in X_pred.columns:
+                _empty.append(_f); continue
+            _fill = pd.to_numeric(X_pred[_f], errors="coerce").notna().mean()
+            if _fill == 0.0:
+                _empty.append(_f)
+            elif _fill < 0.5:
+                _sparse.append((_f, _fill))
+        if _sparse:
+            print("  WARN: sparse features at prediction time: "
+                  + ", ".join(f"{f} {v:.0%}" for f, v in _sparse[:8]))
+        if _empty:
+            raise RuntimeError(
+                f"{len(_empty)} of {len(_need)} model features are EMPTY at "
+                f"prediction time: {_empty[:10]}"
+                + (" ..." if len(_empty) > 10 else "")
+                + ". The training and prediction feature paths have drifted -- "
+                  "anything added to model._compute_context must also be built "
+                  "in build_upcoming_context_mlb. Refusing to predict."
+            )
+
     preds = ml.predict(clf, X_pred, win_clf=_bundle.get("win_clf"))
 
     # Attach context columns for display
@@ -958,6 +1138,43 @@ def _run(
         for col in display_cols:
             if col in upcoming_context.columns:
                 preds[col] = preds.index.map(upcoming_context[col])
+
+    # ------------------------------------------------------------------
+    # Enforce p(A) + p(B) = 1 across the two sides of a game
+    # ------------------------------------------------------------------
+    # The model scores each team independently and nothing constrains it to
+    # treat one game consistently from both sides. Measured over 2313 held-out
+    # 2025 games the two win probabilities summed to between 0.609 and 1.366,
+    # with 54% of games off by more than 0.05 -- that incoherence is what
+    # produced moneyline EVs above +1.00.
+    #
+    # Splitting the discrepancy evenly projects onto the space where the pair
+    # is coherent, and it is strictly better on every metric over those games:
+    #   AUC      0.6969 -> 0.7193
+    #   log loss 0.6370 -> 0.6321
+    #   Brier    0.2230 -> 0.2205
+    # Rows with p > 0.70 fall from 235 to 163, which is the inflated tail.
+    if "opponent" in preds.columns and "win_prob" in preds.columns:
+        if preds.index.has_duplicates:
+            # Doubleheaders would mis-pair a team with the wrong game.
+            print("  WARN: duplicate team rows -- skipping win_prob symmetrisation.")
+        else:
+            _wp  = pd.to_numeric(preds["win_prob"], errors="coerce")
+            _sym = _wp.copy()
+            _n   = 0
+            for _t in preds.index:
+                _o = preds.at[_t, "opponent"]
+                if pd.isna(_o) or _o not in _wp.index:
+                    continue
+                if pd.isna(_wp[_t]) or pd.isna(_wp[_o]):
+                    continue
+                _sym[_t] = _wp[_t] + (1.0 - (_wp[_t] + _wp[_o])) / 2.0
+                _n += 1
+            if _n:
+                preds["win_prob_raw"] = _wp
+                preds["win_prob"] = _sym.clip(1e-6, 1.0 - 1e-6)
+                print(f"  Symmetrised win_prob for {_n} team rows "
+                      f"(largest shift {(_sym - _wp).abs().max():.3f}).")
 
     # Relative coverprob diff vs opponent (useful for edge signal display)
     def _rel(row, col):

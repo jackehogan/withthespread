@@ -28,3 +28,7 @@ __pycache__/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Cached football-data.co.uk CSVs (re-fetchable)
+data/football_data/
+data/*.json.gz
