@@ -52,8 +52,13 @@ _XGB_FIXED = {"enable_categorical": True, "tree_method": "hist"}
 _CAT_COLS = ("period",)
 
 _LOOKBACK_CANDIDATES     = [7, 10, 15]
-_K_CANDIDATES            = [16, 32, 48, 64]
-_ELO_WINDOW              = 20    # EDA showed 20-game window has ~8x signal vs full-season cumulative
+# Elo K is no longer searched. Walk-forward validation over 2023-2026 (~8,000
+# out-of-sample games) found per-fold K selection performed no better than a
+# single fixed value, and two independent criteria -- log loss and the
+# realised-vs-claimed slope ratio -- both landed on 6. The list is kept at
+# length one so the surrounding search plumbing and the saved bundle format
+# stay unchanged. See elo.py for the derivation.
+_K_CANDIDATES            = [6.0]
 _BP_FATIGUE_DAYS         = 14    # fixed rolling window for bp_ip_14d — not a hyperparameter
 
 # style_edge is not fed to the model. Measured on the 2025 hold-out it scored
@@ -104,8 +109,20 @@ _HYPEROPT_SPACE = {
 _MARKET_BLIND = True
 _MARKET_FEATURES = ("ml_implied_prob", "spread")
 
-_ATS_ELO_WINDOW = 40   # wider than standard Elo: spreadscore is the noisier signal
-_LONG_ELO_WINDOW = 40  # same horizon as ATS Elo, but driven by diff, not spreadscore
+# MLB bets the moneyline only -- predict_mlb sets bet="ML" unconditionally and
+# prices it from win_prob -- so the cover classifier is trained and saved for
+# nothing. Set False to skip fitting it; `coverprob` then comes back NaN and
+# callers fall back to the win model.
+#
+# Keep this True for a spread sport. The spreadscore pivot, the SS-derived
+# features and _SPREAD_DERIVED_FEATURES are all left in place precisely so the
+# cover target can be switched back on without rebuilding them.
+#
+# Note the hyperopt search still optimises the COVER label either way, and
+# win_clf inherits those hyperparameters. That is unchanged here deliberately,
+# so this flag alters what is fitted and not how anything is tuned; retuning on
+# the win label is a separate change worth measuring on its own.
+_TRAIN_COVER_MODEL = False
 
 # Features built on spreadscore ( = diff + spread ). The run line's sign is the
 # book's favourite/underdog call, so these carry market information even though
@@ -122,62 +139,13 @@ _LONG_ELO_WINDOW = 40  # same horizon as ATS Elo, but driven by diff, not spread
 # rate back explicitly gains nothing (.5730), confirming the market term is
 # already carried by Elo.
 _SPREAD_DERIVED_FEATURES = (
-    "ats_elo_diff", "ats_opp_elo", "1_ago_ss", "ss_mean_5",
-    "cover_streak", "fade_streak",
+    "1_ago_ss", "ss_mean_5", "cover_streak", "fade_streak",
 )
 
 # Innings of in-season work at which season-to-date ERA and last season's ERA
 # carry equal weight. Tested over 15,818 starts at lambda 10/25/50/100;
 # 25-50 was flat-optimal, 10 chased noise and 100 clung to stale data.
 _SP_ERA_BLEND_LAMBDA = 50.0
-
-
-def _attach_ats_elo(elo_df: pd.DataFrame, games_df: pd.DataFrame,
-                    k: float) -> pd.DataFrame:
-    """
-    Add ats_elo_diff / ats_opp_elo alongside the standard Elo columns.
-
-    Same rating machinery, driven by spreadscore instead of run differential,
-    so it rates COVERING rather than winning. Returns the frame unchanged if
-    spreadscore is unavailable.
-    """
-    if "spreadscore" not in games_df.columns:
-        elo_df["ats_elo_diff"] = np.nan
-        elo_df["ats_opp_elo"] = np.nan
-        return elo_df
-    sub = games_df.dropna(subset=["spreadscore"])
-    if sub.empty:
-        elo_df["ats_elo_diff"] = np.nan
-        elo_df["ats_opp_elo"] = np.nan
-        return elo_df
-    ats = elo_mod.compute(sub, k=k, window=_ATS_ELO_WINDOW,
-                          value_col="spreadscore")
-    elo_df["ats_elo_diff"] = ats["elo_diff"].reindex(elo_df.index)
-    elo_df["ats_opp_elo"]  = ats["opp_elo"].reindex(elo_df.index)
-    return elo_df
-
-
-def _attach_long_elo(elo_df: pd.DataFrame, games_df: pd.DataFrame,
-                     k: float) -> pd.DataFrame:
-    """
-    Add long_elo_diff / long_opp_elo: the same 40-game horizon ATS Elo uses,
-    but driven by `diff`, so it rates winning rather than covering. This is the
-    market-free counterpart to the ATS pair, and the win model's replacement
-    for it.
-    """
-    if "diff" not in games_df.columns:
-        elo_df["long_elo_diff"] = np.nan
-        elo_df["long_opp_elo"] = np.nan
-        return elo_df
-    sub = games_df.dropna(subset=["diff"])
-    if sub.empty:
-        elo_df["long_elo_diff"] = np.nan
-        elo_df["long_opp_elo"] = np.nan
-        return elo_df
-    lg = elo_mod.compute(sub, k=k, window=_LONG_ELO_WINDOW, value_col="diff")
-    elo_df["long_elo_diff"] = lg["elo_diff"].reindex(elo_df.index)
-    elo_df["long_opp_elo"]  = lg["opp_elo"].reindex(elo_df.index)
-    return elo_df
 
 
 def _cover_and_win_labels(ss_vals, ctx_aligned) -> tuple[pd.Series, pd.Series]:
@@ -264,9 +232,7 @@ def _precompute(
     train_elo_by_k = {}
     eval_elo_by_k  = {}
     for k in k_values:
-        er = elo_mod.compute(games_df, k=k, window=_ELO_WINDOW)
-        er = _attach_ats_elo(er, games_df, k)
-        er = _attach_long_elo(er, games_df, k)
+        er = elo_mod.compute(games_df, k=k)
         elo_by_k[k]       = er
         _eval_mask = er.index.get_level_values("season") == eval_season
         train_elo_by_k[k] = er[~_eval_mask]
@@ -362,20 +328,13 @@ def _precompute(
         _CTX = [c for c in _CTX if c not in _MARKET_FEATURES]
 
     def _add_elo(df_base, common, elo_by_p, target):
-        """Return (elo_diff, opponent_elo, ats_*, long_*)."""
+        """Return (elo_diff, opponent_elo)."""
         _nan = np.full(len(common), np.nan)
         elo_grp = elo_by_p.get(target)
         if elo_grp is None:
-            return _nan, _nan, _nan, _nan, _nan, _nan
+            return _nan, _nan
         ea = elo_grp.reindex(common)
-        return (
-            ea["elo_diff"].values,
-            ea["opp_elo"].values,
-            ea["ats_elo_diff"].values if "ats_elo_diff" in ea.columns else _nan,
-            ea["ats_opp_elo"].values  if "ats_opp_elo"  in ea.columns else _nan,
-            ea["long_elo_diff"].values if "long_elo_diff" in ea.columns else _nan,
-            ea["long_opp_elo"].values  if "long_opp_elo"  in ea.columns else _nan,
-        )
+        return ea["elo_diff"].values, ea["opp_elo"].values
 
     for target in all_targets:
         # --- train split ---
@@ -397,9 +356,7 @@ def _precompute(
                 y_cov_tr, y_win_tr = _cover_and_win_labels(y_tr, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
-                    (df_k["elo_diff"], df_k["opponent_elo"],
-                     df_k["ats_elo_diff"], df_k["ats_opp_elo"],
-                     df_k["long_elo_diff"], df_k["long_opp_elo"]) = _add_elo(
+                    (df_k["elo_diff"], df_k["opponent_elo"]) = _add_elo(
                         base, common, train_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
@@ -426,9 +383,7 @@ def _precompute(
                 y_cov_ev, y_win_ev = _cover_and_win_labels(y_ev, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
-                    (df_k["elo_diff"], df_k["opponent_elo"],
-                     df_k["ats_elo_diff"], df_k["ats_opp_elo"],
-                     df_k["long_elo_diff"], df_k["long_opp_elo"]) = _add_elo(
+                    (df_k["elo_diff"], df_k["opponent_elo"]) = _add_elo(
                         base, common, eval_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
@@ -577,8 +532,7 @@ def build_features(
         train_ctx = context[~context.index.get_level_values("season").isin([eval_season])]
         eval_ctx  = context[context.index.get_level_values("season") == eval_season]
 
-        elo_ratings = _attach_ats_elo(
-            elo_mod.compute(games_df, k=best_k, window=_ELO_WINDOW), games_df, best_k)
+        elo_ratings = elo_mod.compute(games_df, k=best_k)
         train_elo   = elo_ratings[
             ~elo_ratings.index.get_level_values("season").isin([eval_season])
         ]
@@ -1213,17 +1167,9 @@ def _collect_window(
         elo_aligned  = elo_slice.reindex(common_idx)
         df["elo_diff"]     = elo_aligned["elo_diff"].values
         df["opponent_elo"] = elo_aligned["opp_elo"].values
-        for _src, _dst in (("ats_elo_diff", "ats_elo_diff"),
-                           ("ats_opp_elo", "ats_opp_elo"),
-                           ("long_elo_diff", "long_elo_diff"),
-                           ("long_opp_elo", "long_opp_elo")):
-            df[_dst] = (elo_aligned[_src].values
-                        if _src in elo_aligned.columns else np.nan)
     except KeyError:
         df["elo_diff"]     = np.nan
         df["opponent_elo"] = np.nan
-        df["long_elo_diff"] = np.nan
-        df["long_opp_elo"]  = np.nan
 
     _recast_categoricals(df)
     for col in df.columns:
@@ -1302,14 +1248,10 @@ def build_prediction_features(
             X[col] = np.nan
 
     # Elo ratings for upcoming game (pre-game, using all completed games this season).
-    # Must mirror _precompute exactly — the model expects both the standard and
-    # the ATS rating, and a missing column at prediction time would silently
-    # become NaN for every team.
-    elo_df = elo_mod.compute(completed, k=best_k, window=_ELO_WINDOW)
-    elo_df = _attach_ats_elo(elo_df, completed, best_k)
-    elo_df = _attach_long_elo(elo_df, completed, best_k)
-    _elo_cols = ["elo", "opp_elo", "elo_diff", "ats_elo_diff", "ats_opp_elo",
-                 "long_elo_diff", "long_opp_elo"]
+    # Must mirror _precompute exactly — a column present in training but missing
+    # here would silently become NaN for every team.
+    elo_df = elo_mod.compute(completed, k=best_k)
+    _elo_cols = ["elo", "opp_elo", "elo_diff"]
     latest_elo = (
         elo_df.reset_index()
         .sort_values("period")
@@ -1319,14 +1261,6 @@ def build_prediction_features(
     )
     X["elo_diff"]     = X["team"].map(latest_elo["elo_diff"])
     X["opponent_elo"] = X["team"].map(latest_elo["opp_elo"])
-    X["ats_elo_diff"] = X["team"].map(latest_elo["ats_elo_diff"]) \
-        if "ats_elo_diff" in latest_elo.columns else np.nan
-    X["ats_opp_elo"]  = X["team"].map(latest_elo["ats_opp_elo"]) \
-        if "ats_opp_elo" in latest_elo.columns else np.nan
-    X["long_elo_diff"] = X["team"].map(latest_elo["long_elo_diff"]) \
-        if "long_elo_diff" in latest_elo.columns else np.nan
-    X["long_opp_elo"]  = X["team"].map(latest_elo["long_opp_elo"]) \
-        if "long_opp_elo" in latest_elo.columns else np.nan
 
     # style_edge is not produced. It contributed nothing to the model, and
     # fitting the StyleModel here meant a full SVD of the season's matchup
@@ -1491,40 +1425,45 @@ def train_models(
         print("    All key features OK.")
 
     print("  Tuning binary cover classifier...")
-    clf = XGBClassifier(
-        **_XGB_FIXED, random_state=42,
-        **_tune(XGBClassifier, X_train, y_train, max_evals, seed=seed)
-    )
-    clf.fit(X_train, y_train)
+    _tuned_params = {
+        **_XGB_FIXED, "random_state": 42,
+        **_tune(XGBClassifier, X_train, y_train, max_evals, seed=seed),
+    }
+    clf = XGBClassifier(**_tuned_params)
+    if _TRAIN_COVER_MODEL:
+        clf.fit(X_train, y_train)
+    else:
+        print("  _TRAIN_COVER_MODEL is False -- skipping the cover fit; "
+              "its tuned hyperparameters still carry to the win model.")
 
     # Evaluation metrics
     from sklearn.metrics import roc_auc_score, accuracy_score
-    train_acc = float(accuracy_score(y_train, clf.predict(X_train)))
-    try:
-        train_roc = float(roc_auc_score(y_train, clf.predict_proba(X_train)[:, 1]))
-    except ValueError:
-        train_roc = float("nan")
+    scores = {"lookback": best_lookback, "elo_k": best_k}
 
-    scores = {
-        "lookback":      best_lookback,
-        "elo_k":         best_k,
-        "clf_train_acc": round(train_acc, 3),
-        "clf_train_roc": round(train_roc, 3),
-    }
-    if not X_test.empty:
+    if _TRAIN_COVER_MODEL:
+        scores["clf_train_acc"] = round(
+            float(accuracy_score(y_train, clf.predict(X_train))), 3)
         try:
-            test_roc = float(roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1]))
-            scores["clf_test_roc"] = round(test_roc, 3)
-            scores["clf_test_acc"] = round(float(accuracy_score(y_test, clf.predict(X_test))), 3)
+            scores["clf_train_roc"] = round(
+                float(roc_auc_score(y_train, clf.predict_proba(X_train)[:, 1])), 3)
         except ValueError:
-            pass
-    if not X_val.empty:
-        try:
-            val_roc = float(roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1]))
-            scores["clf_val_roc"] = round(val_roc, 3)
-            scores["clf_val_acc"] = round(float(accuracy_score(y_val, clf.predict(X_val))), 3)
-        except ValueError:
-            pass
+            scores["clf_train_roc"] = float("nan")
+        if not X_test.empty:
+            try:
+                scores["clf_test_roc"] = round(float(
+                    roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1])), 3)
+                scores["clf_test_acc"] = round(float(
+                    accuracy_score(y_test, clf.predict(X_test))), 3)
+            except ValueError:
+                pass
+        if not X_val.empty:
+            try:
+                scores["clf_val_roc"] = round(float(
+                    roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1])), 3)
+                scores["clf_val_acc"] = round(float(
+                    accuracy_score(y_val, clf.predict(X_val))), 3)
+            except ValueError:
+                pass
 
     # --- Second target: P(win outright), for the moneyline market ---
     # Same features, different label. Trained on the rows where a win label
@@ -1538,7 +1477,7 @@ def train_models(
               f"with a derivable win label...")
         # get_xgb_params() already carries random_state and the fixed settings,
         # so merge rather than splatting both and colliding on duplicate keys.
-        _win_params = dict(clf.get_xgb_params())
+        _win_params = dict(_tuned_params)
         _win_params.update(_XGB_FIXED)
         _win_params["random_state"] = 42
         win_clf = XGBClassifier(**_win_params)
@@ -1575,7 +1514,8 @@ def train_models(
     all_X_parts = [X_train] + ([X_test] if not X_test.empty else []) + ([X_val] if not X_val.empty else [])
     all_y_parts = [y_train] + ([y_test] if not X_test.empty else []) + ([y_val] if not X_val.empty else [])
     _all_X = pd.concat(all_X_parts, ignore_index=True)
-    clf.fit(_all_X, pd.concat(all_y_parts, ignore_index=True))
+    if _TRAIN_COVER_MODEL:
+        clf.fit(_all_X, pd.concat(all_y_parts, ignore_index=True))
 
     if win_clf is not None:
         all_w_parts = [win_labels["train"]] \
@@ -1587,7 +1527,7 @@ def train_models(
             _wd = [c for c in _SPREAD_DERIVED_FEATURES if c in _all_X.columns]
             win_clf.fit(_all_X.drop(columns=_wd)[_m], _all_w[_m])
 
-    return clf, scores, best_lookback, best_k, style_model, win_clf
+    return (clf if _TRAIN_COVER_MODEL else None), scores, best_lookback,         best_k, style_model, win_clf
 
 
 # ---------------------------------------------------------------------------
@@ -1602,7 +1542,7 @@ _DEFAULT_MODEL_PATH = _os.path.join(_os.path.dirname(__file__), "data", "mlb_mod
 
 
 def save_model(
-    clf: XGBClassifier,
+    clf: "XGBClassifier | None",
     scores: dict,
     best_lookback: int,
     best_k: int | float,
@@ -1675,7 +1615,7 @@ def load_model(path: str = _DEFAULT_MODEL_PATH) -> dict:
 # ---------------------------------------------------------------------------
 
 def predict(
-    clf: XGBClassifier,
+    clf: "XGBClassifier | None",
     X_pred: pd.DataFrame,
     win_clf: "XGBClassifier | None" = None,
 ) -> pd.DataFrame:
@@ -1687,7 +1627,8 @@ def predict(
 
     Parameters
     ----------
-    clf     : fitted cover classifier (from train_models / load_model)
+    clf     : fitted cover classifier, or None when _TRAIN_COVER_MODEL is off
+              (MLB is moneyline-only). coverprob is NaN in that case.
     X_pred  : feature matrix with a `team` column (from build_prediction_features)
     win_clf : optional win classifier. Absent in bundles saved before the
               dual-target change, in which case win_prob is NaN and callers
@@ -1696,12 +1637,16 @@ def predict(
     Returns
     -------
     DataFrame indexed by team with columns:
-        coverprob : P(team covers the run line)
+        coverprob : P(team covers the run line), or NaN if no cover model
         win_prob  : P(team wins outright), or NaN if no win model
     """
-    feat_cols = clf.get_booster().feature_names
-    coverprob = clf.predict_proba(X_pred[feat_cols])[:, 1]
-    teams     = X_pred["team"].values
+    teams = X_pred["team"].values
+
+    if clf is not None:
+        feat_cols = clf.get_booster().feature_names
+        coverprob = clf.predict_proba(X_pred[feat_cols])[:, 1]
+    else:
+        coverprob = np.full(len(teams), np.nan)
 
     out = pd.DataFrame({"coverprob": coverprob}, index=teams)
 
