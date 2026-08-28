@@ -65,12 +65,94 @@ _K_CANDIDATES            = [16.0]
 # the ablation for whether the second horizon was what mattered. K=24 half-lives
 # in roughly 20 games against K=6's 80. Set to None to disable.
 _FAST_ELO_K              = 24.0
+
+# How a feature's matchup information is presented to the tree.
+#   "edge" : own value + (opponent - own), the differenced form
+#   "opp"  : own value + the opponent's raw value
+#   "both" : all three columns
+# edge = opp - own exactly, so any two of the three span the same space -- but a
+# tree splits on axis-aligned thresholds, so which two are supplied changes the
+# splits available. A per-feature test on held-out 2025-26 found own+opp beat
+# own+edge in 3 of 4 features, while the full-model test found the edges worth
+# +0.045 out of sample. Those are in tension: the edges may have helped because
+# four form features had NO opponent counterpart at all, in which case opp
+# mirrors would do the same job. This switch exists to settle it.
+_MATCHUP_MODE = "opp"
+
+# The three edges that predate this work. They were hard-coded into
+# _matchup_cols, so the mode switch did not govern them and "opp" mode was
+# really own+opp PLUS three stray edges. Routed through the switch so the mode
+# means what it says.
+_LEGACY_EDGE_FEATURES = ["sp_era_edge", "sp_era_rolling_edge", "bp_era_edge"]
+
+_EDGE_FEATURES = _LEGACY_EDGE_FEATURES + [
+    "sp_whip_edge", "sp_k9_edge", "sp_ip_per_start_edge",
+    "bp_whip_edge", "bp_k9_edge", "bp_hr9_edge", "bp_ip_per_game_edge",
+    "1_ago_diff_edge", "diff_mean_5_edge", "win_streak_edge", "loss_streak_edge",
+]
+# Mirrors for the same features. sp_era/sp_whip/bp_era/bp_whip already have an
+# opp_ column built earlier, so they are not repeated here.
+_OPP_FEATURES = [
+    "opp_bp_ip_14d", "opp_is_b2b",
+    "opp_sp_k9", "opp_sp_ip_per_start",
+    "opp_bp_k9", "opp_bp_hr9", "opp_bp_ip_per_game",
+    "opp_1_ago_diff", "opp_diff_mean_5", "opp_win_streak", "opp_loss_streak",
+]
+
+
+# Set False to build without the in-season bullpen rates and the 30-day
+# workload. Used with _MATCHUP_MODE="none" to reconstruct a leak-free
+# baseline, so this session's additions can be measured against something
+# rather than against a number that was itself inflated by the opponent
+# lookup bug.
+_BP_ROLLING = True
+
+_BP_ROLLING_FEATURES = ["bp_era_rolling", "bp_whip_rolling",
+                        "bp_k9_rolling", "bp_pitch_30d"]
+_BP_ROLLING_OPP = ["opp_bp_era_rolling", "opp_bp_whip_rolling",
+                   "opp_bp_k9_rolling", "opp_bp_pitch_30d"]
+
+
+def _bp_rolling_features() -> list:
+    return list(_BP_ROLLING_FEATURES) if _BP_ROLLING else []
+
+
+def _matchup_extra_features() -> list:
+    """Feature names added by the current _MATCHUP_MODE."""
+    if _MATCHUP_MODE == "none":
+        return []
+    _bp = list(_BP_ROLLING_OPP) if _BP_ROLLING else []
+    if _MATCHUP_MODE == "opp":
+        return list(_OPP_FEATURES) + _bp
+    if _MATCHUP_MODE == "both":
+        return list(_EDGE_FEATURES) + list(_OPP_FEATURES) + _bp
+    return list(_EDGE_FEATURES)
 # EXPERIMENT ONLY (branch elo-revert-test): reproduce the pre-rebuild Elo
 # feature set exactly -- elo_diff at the league-wide window 20, plus a second
 # rating at window 40 standing in for long_elo_diff/long_opp_elo -- to test
 # whether reverting the rating recovers win_val_roc 0.615.
 _REVERT_TEST_WINDOW      = 40
 _BP_FATIGUE_DAYS         = 14    # fixed rolling window for bp_ip_14d — not a hyperparameter
+
+# Bullpen workload window and rate shrinkage, both swept on 2022-2026 and scored
+# ORTHOGONALISED against the Elo edge, so these are gains over what a team
+# rating already knows.
+#
+# Workload: 30 days of PITCH COUNT, ex-Elo 0.5432. Pitch count beat innings at
+# every window (0.5432 vs 0.5286), and long beat short everywhere -- 1-day and
+# 3-day workload score BELOW 0.500 ex-Elo, i.e. worse than nothing. That means
+# this is not measuring fatigue: a bullpen that has thrown a lot over a month is
+# one whose rotation is not going deep, so it is a rotation-depth proxy. Genuine
+# short-term rest carries no signal here, plausibly because a gassed reliever
+# simply does not appear.
+_BP_WORKLOAD_DAYS        = 30
+
+# Rate shrinkage: w = season_ip / (season_ip + lambda). lambda=200 means the
+# bullpen's own season does not outweigh last year's until team game ~55 of 162,
+# and last season still holds 25% in October. Four times the starters' lambda,
+# because a bullpen is a dozen arms in shifting roles -- more innings, less
+# signal per inning. K/9 is the most stable and wants the most evidence.
+_BP_RATE_LAMBDA          = {"era": 200.0, "whip": 200.0, "k9": 400.0}
 
 # style_edge is not fed to the model. Measured on the 2025 hold-out it scored
 # exactly 0.00 on both SHAP and XGBoost gain — the trees never split on it once
@@ -331,14 +413,14 @@ def _precompute(
     _CTX = [
         "home", "is_b2b",
         "sp_era", "sp_whip", "sp_k9", "sp_ip_per_start",
-        "opp_sp_era", "opp_sp_whip", "sp_era_edge",
-        "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
+        "opp_sp_era", "opp_sp_whip",
+        "sp_era_rolling", "opp_sp_era_rolling",
         "bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game",
-        "opp_bp_era", "opp_bp_whip", "bp_era_edge",
+        "opp_bp_era", "opp_bp_whip",
         "ml_implied_prob",
         "bp_ip_14d",
         "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
-    ] + ["sp_whip_edge","sp_k9_edge","sp_ip_per_start_edge","bp_whip_edge","bp_k9_edge","bp_hr9_edge","bp_ip_per_game_edge","1_ago_diff_edge","diff_mean_5_edge","win_streak_edge","loss_streak_edge"]
+    ] + _bp_rolling_features() + _matchup_extra_features()
 
     if _MARKET_BLIND:
         _CTX = [c for c in _CTX if c not in _MARKET_FEATURES]
@@ -682,6 +764,48 @@ def _american_to_raw_prob(ml) -> float:
         return 100.0 / (ml + 100.0)
 
 
+def _opponent_period(df: pd.DataFrame) -> pd.Series:
+    """The opponent's own `period` for THIS game, keyed on game_pk."""
+    if "game_pk" not in df.columns or not df["game_pk"].notna().any():
+        return pd.Series(np.nan, index=df.index)
+    src = df.drop_duplicates(subset=["game_pk", "team"]).set_index(
+        ["game_pk", "team"])["period"]
+    return pd.Series(
+        [src.get((pk, o), np.nan) for pk, o in zip(df["game_pk"], df["opponent"])],
+        index=df.index)
+
+
+def _opponent_values(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    """
+    Values of `cols` from the OPPONENT's own row for the SAME game.
+
+    MUST key on game_pk, never on (opponent, season, our_period). `period` is a
+    per-team game counter, so the two sides of a game sit at different periods
+    70% of the time. Keying on our period lands on a different game of theirs,
+    and 34.6% of the time that game is in the FUTURE -- median 2 days ahead --
+    which leaks the result being predicted.
+
+    Measured on 2023-2025: opp_1_ago_diff scored |AUC-0.5| = 0.1084 under the
+    broken lookup and 0.0181 once fixed. All of the difference came from the
+    future-resolving rows, which alone scored AUC 0.2116 (0.4958 on the
+    past-resolving ones, i.e. nothing). Only 36.5% of the broken values matched
+    the correct ones.
+
+    Season-constant columns are unaffected either way; time-varying ones are not.
+    """
+    have = [c for c in cols if c in df.columns]
+    out = pd.DataFrame({c: np.nan for c in cols}, index=df.index)
+    if not have or "game_pk" not in df.columns or not df["game_pk"].notna().any():
+        return out
+    src = df.drop_duplicates(subset=["game_pk", "team"]).set_index(
+        ["game_pk", "team"])[have]
+    vals = src.reindex(list(zip(df["game_pk"], df["opponent"])))
+    vals.index = df.index
+    for c in have:
+        out[c] = vals[c]
+    return out
+
+
 def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute per-(team, season, period) context features:
@@ -732,19 +856,13 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     # edges existed before this (sp_era, bp_era, elo), and the four form
     # features had no opponent counterpart at all, which is why elo_diff was
     # carrying the opponent's recent form single-handedly.
-    _EDGE_COLS = [
-        "sp_whip_edge", "sp_k9_edge", "sp_ip_per_start_edge",
-        "bp_whip_edge", "bp_k9_edge", "bp_hr9_edge", "bp_ip_per_game_edge",
-        "1_ago_diff_edge", "diff_mean_5_edge",
-        "win_streak_edge", "loss_streak_edge",
-    ]
     _matchup_cols = [
-        "opp_sp_era", "opp_sp_whip", "sp_era_edge",
-        "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
-        "opp_bp_era", "opp_bp_whip", "bp_era_edge",
+        "opp_sp_era", "opp_sp_whip",
+        "sp_era_rolling", "opp_sp_era_rolling",
+        "opp_bp_era", "opp_bp_whip",
         "ml_implied_prob",
         "bp_ip_14d",   # rolling N-day bullpen fatigue (seeded separately)
-    ] + _EDGE_COLS
+    ] + _bp_rolling_features() + _matchup_extra_features()
     _all_out = ["home", "is_b2b"] + _CTX_FEAT + _matchup_cols + _DIFF_FEATS + _LABEL_COLS
 
     if not needed.issubset(games_df.columns):
@@ -758,6 +876,10 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     cols = ["team", "season", "period", "date", "home"] + odds_present + label_present
     if opp_present:
         cols.append("opponent")
+    # game_pk is the join key for every opponent lookup -- see _opponent_values.
+    # Without it those lookups silently return all-NaN.
+    if "game_pk" in games_df.columns:
+        cols.append("game_pk")
 
     df = games_df[cols].copy()
     df = df.sort_values(["team", "season", "period"])
@@ -779,10 +901,7 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
     lookup_cols   = pitchers_have + bullpen_have
 
     if opp_present and lookup_cols:
-        matchup_lookup = df.set_index(["team", "season", "period"])[lookup_cols]
-        opp_keys = list(zip(df["opponent"], df["season"], df["period"]))
-        opp_vals = matchup_lookup.reindex(opp_keys)
-        opp_vals.index = df.index
+        opp_vals = _opponent_values(df, lookup_cols)
 
         # MLB starter matchup edges (lower ERA = better pitcher)
         if "sp_era" in pitchers_have:
@@ -813,8 +932,10 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
             if _col in lookup_cols:
                 _opp = opp_vals[_col].values
                 df[_name] = ((df[_col] - _opp) if _sign > 0 else (_opp - df[_col]))
+                df["opp_" + _col] = _opp
             else:
                 df[_name] = np.nan
+                df["opp_" + _col] = np.nan
     else:
         for c in _matchup_cols:
             df[c] = np.nan
@@ -835,12 +956,10 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
         if _price_col == "spread_juice" and "moneyline" in df.columns:
             price = price.fillna(df["moneyline"])
 
+        # Same game_pk keying as every other opponent lookup -- de-vigging
+        # against a price from a different game of theirs is meaningless.
         tmp = df.assign(_price=price)
-        ml_lookup = tmp.set_index(["team", "season", "period"])["_price"]
-        opp_ml = ml_lookup.reindex(
-            list(zip(df["opponent"], df["season"], df["period"]))
-        )
-        opp_ml.index = df.index
+        opp_ml = _opponent_values(tmp, ["_price"])["_price"]
 
         p_self = price.apply(_american_to_raw_prob)
         p_opp  = opp_ml.apply(_american_to_raw_prob)
@@ -860,6 +979,15 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
         for t, s, p in zip(df["team"], df["season"], df["period"])
     ]
 
+    # --- Bullpen workload and in-season rates ---
+    _keys = list(zip(df["team"], df["season"], df["period"]))
+    _wl = _compute_bp_workload(games_df, _BP_WORKLOAD_DAYS,
+                               "bp_pitch_game", "bp_pitch_30d").to_dict()
+    df["bp_pitch_30d"] = [_wl.get(k, np.nan) for k in _keys]
+    for _rate in ("era", "whip", "k9"):
+        _d = _compute_bp_rolling_rate(games_df, _rate).to_dict()
+        df[f"bp_{_rate}_rolling"] = [_d.get(k, np.nan) for k in _keys]
+
     # --- Rolling 5-start SP ERA ---
     # Per-pitcher rolling ERA computed from in-season boxscore data (sp_ip_game,
     # sp_er_game). Falls back to prior-season sp_era for first 2 starts or when
@@ -874,8 +1002,10 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
 
     # Opponent rolling ERA and edge
     if opp_present:
-        opp_keys = list(zip(df["opponent"], df["season"], df["period"]))
-        df["opp_sp_era_rolling"] = [_sp_roll_dict.get(k, np.nan) for k in opp_keys]
+        _op = _opponent_period(df)
+        df["opp_sp_era_rolling"] = [
+            _sp_roll_dict.get((o, se, int(pp)), np.nan) if pp == pp else np.nan
+            for o, se, pp in zip(df["opponent"], df["season"], _op)]
         df["sp_era_rolling_edge"] = (
             df["opp_sp_era_rolling"].astype(float) - df["sp_era_rolling"].astype(float)
         )
@@ -926,17 +1056,30 @@ def _compute_context(games_df: pd.DataFrame) -> pd.DataFrame:
                    ("win_streak_edge",  "win_streak",  +1),
                    ("loss_streak_edge", "loss_streak", -1)]
     if opp_present:
-        _form_lookup = df.set_index(["team", "season", "period"])[
-            [c for _, c, _s in _FORM_EDGES]]
-        _fk = list(zip(df["opponent"], df["season"], df["period"]))
-        _fv = _form_lookup.reindex(_fk)
-        _fv.index = df.index
+        _fv = _opponent_values(df, [c for _, c, _s in _FORM_EDGES])
         for _name, _col, _sign in _FORM_EDGES:
             _opp = _fv[_col].values
             df[_name] = ((df[_col] - _opp) if _sign > 0 else (_opp - df[_col]))
+            df["opp_" + _col] = _opp
     else:
         for _name, _col, _sign in _FORM_EDGES:
             df[_name] = np.nan
+            df["opp_" + _col] = np.nan
+
+    # --- Late mirrors ---
+    # bp_ip_14d and is_b2b are built after the matchup lookup, so they need a
+    # second pass. Both are comparative by nature: a depleted bullpen matters
+    # against a fresh one, and a team on no rest matters against a rested one.
+    _LATE_MIRROR = ["bp_ip_14d", "is_b2b"] + _bp_rolling_features()
+    if opp_present:
+        _lm_have = [c for c in _LATE_MIRROR if c in df.columns]
+        if _lm_have:
+            _lm = _opponent_values(df, _lm_have)
+            for _c in _LATE_MIRROR:
+                df["opp_" + _c] = _lm[_c].values if _c in _lm_have else np.nan
+    else:
+        for _c in _LATE_MIRROR:
+            df["opp_" + _c] = np.nan
 
     out_cols = [c for c in _all_out if c in df.columns]
     return df.set_index(["team", "season", "period"])[out_cols]
@@ -1029,6 +1172,87 @@ def _compute_sp_rolling_era(
             result[key] = val
 
     return result
+
+
+def _compute_bp_workload(games_df: pd.DataFrame, days: int, col: str,
+                         name: str) -> pd.Series:
+    """Sum of `col` over the `days` calendar days before each game, current excluded."""
+    idx = pd.MultiIndex.from_frame(games_df[["team", "season", "period"]])
+    if col not in games_df.columns:
+        return pd.Series(np.nan, index=idx, name=name)
+    w = games_df[["team", "season", "date", "period", col]].copy()
+    w["date"] = pd.to_datetime(w["date"])
+    w[col] = pd.to_numeric(w[col], errors="coerce")
+    w = w.sort_values(["team", "season", "date"])
+    rows = []
+    for (team, season_val), grp in w.groupby(["team", "season"]):
+        grp = grp.set_index("date").sort_index()
+        roll = grp[col].shift(1, freq="D").rolling(f"{days}D").sum()
+        for period, val in zip(grp["period"], roll.values):
+            rows.append({"team": team, "season": season_val,
+                         "period": int(period), name: val})
+    if not rows:
+        return pd.Series(np.nan, index=idx, name=name)
+    return pd.DataFrame(rows).set_index(["team", "season", "period"])[name]
+
+
+_BP_RATE_SPEC = {
+    "era":  (["bp_er_game"], 9.0, "bp_era"),
+    "whip": (["bp_bb_game", "bp_h_game"], 1.0, "bp_whip"),
+    "k9":   (["bp_k_game"], 9.0, "bp_k9"),
+}
+
+
+def _compute_bp_rolling_rate(games_df: pd.DataFrame, rate: str) -> pd.Series:
+    """
+    In-season bullpen rate shrunk toward the prior-season team value.
+
+    Strictly causal: each game sees only the team's earlier games. Falls back to
+    the prior-season number where no in-season innings exist yet, and to the
+    in-season figure where no prior-season number exists.
+    """
+    nums, mult, prior_col = _BP_RATE_SPEC[rate]
+    lam = _BP_RATE_LAMBDA[rate]
+    name = f"bp_{rate}_rolling"
+    idx = pd.MultiIndex.from_frame(games_df[["team", "season", "period"]])
+    need = set(nums) | {"bp_ip_game"}
+    if not need.issubset(games_df.columns):
+        return pd.Series(np.nan, index=idx, name=name)
+
+    d = games_df[["team", "season", "period", "date", "bp_ip_game"] + nums].copy()
+    if prior_col in games_df.columns:
+        d[prior_col] = pd.to_numeric(games_df[prior_col], errors="coerce")
+    else:
+        d[prior_col] = np.nan
+    d["date"] = pd.to_datetime(d["date"])
+    for c_ in nums + ["bp_ip_game"]:
+        d[c_] = pd.to_numeric(d[c_], errors="coerce")
+    sub = d[nums]
+    num = sub.sum(axis=1).to_numpy(dtype=float)
+    num[sub.isna().any(axis=1).to_numpy()] = np.nan
+    d["_num"] = num
+
+    out = []
+    for (team, season_val), grp in d.groupby(["team", "season"], sort=False):
+        grp = grp.sort_values("date")
+        cip = cnum = 0.0
+        for _, r in grp.iterrows():
+            std = (cnum * mult / cip) if cip > 0 else np.nan
+            p = r[prior_col]
+            if not np.isfinite(std):
+                val = p
+            elif not np.isfinite(p):
+                val = std
+            else:
+                wgt = cip / (cip + lam)
+                val = wgt * std + (1 - wgt) * p
+            out.append({"team": team, "season": season_val,
+                        "period": int(r["period"]), name: val})
+            if np.isfinite(r["_num"]) and np.isfinite(r["bp_ip_game"]):
+                cip += float(r["bp_ip_game"]); cnum += float(r["_num"])
+    if not out:
+        return pd.Series(np.nan, index=idx, name=name)
+    return pd.DataFrame(out).set_index(["team", "season", "period"])[name]
 
 
 def _compute_bp_fatigue(games_df: pd.DataFrame, days: int) -> pd.Series:
@@ -1226,14 +1450,14 @@ def _collect_window(
     _CTX_COLS = [
         "home", "is_b2b",
         "sp_era", "sp_whip", "sp_k9", "sp_ip_per_start",
-        "opp_sp_era", "opp_sp_whip", "sp_era_edge",
-        "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
+        "opp_sp_era", "opp_sp_whip",
+        "sp_era_rolling", "opp_sp_era_rolling",
         "bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game",
-        "opp_bp_era", "opp_bp_whip", "bp_era_edge",
+        "opp_bp_era", "opp_bp_whip",
         "ml_implied_prob",
         "bp_ip_14d",
         "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
-    ] + ["sp_whip_edge","sp_k9_edge","sp_ip_per_start_edge","bp_whip_edge","bp_k9_edge","bp_hr9_edge","bp_ip_per_game_edge","1_ago_diff_edge","diff_mean_5_edge","win_streak_edge","loss_streak_edge"]
+    ] + _bp_rolling_features() + _matchup_extra_features()
     try:
         ctx_slice   = context.xs(target, level="period")
         ctx_aligned = ctx_slice.reindex(common_idx)
@@ -1319,14 +1543,14 @@ def build_prediction_features(
     _CTX_COLS = [
         "home", "is_b2b",
         "sp_era", "sp_whip", "sp_k9", "sp_ip_per_start",
-        "opp_sp_era", "opp_sp_whip", "sp_era_edge",
-        "sp_era_rolling", "opp_sp_era_rolling", "sp_era_rolling_edge",
+        "opp_sp_era", "opp_sp_whip",
+        "sp_era_rolling", "opp_sp_era_rolling",
         "bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game",
-        "opp_bp_era", "opp_bp_whip", "bp_era_edge",
+        "opp_bp_era", "opp_bp_whip",
         "ml_implied_prob",
         "bp_ip_14d",
         "1_ago_diff", "diff_mean_5", "win_streak", "loss_streak",
-    ] + ["sp_whip_edge","sp_k9_edge","sp_ip_per_start_edge","bp_whip_edge","bp_k9_edge","bp_hr9_edge","bp_ip_per_game_edge","1_ago_diff_edge","diff_mean_5_edge","win_streak_edge","loss_streak_edge"]
+    ] + _bp_rolling_features() + _matchup_extra_features()
     if _MARKET_BLIND:
         _CTX_COLS = [c for c in _CTX_COLS if c not in _MARKET_FEATURES]
 
@@ -1506,7 +1730,7 @@ def train_models(
     # very little signal and indicates a seeding or name-matching problem.
     _WARN_FILL  = 0.70
     _ERROR_FILL = 0.40
-    _KEY_FEATS  = ["sp_era", "sp_era_edge", "bp_era", "bp_era_edge",
+    _KEY_FEATS  = ["sp_era", "opp_sp_era", "bp_era", "opp_bp_era",
                    "ml_implied_prob", "bp_ip_14d", "elo_diff"]
     print("  Feature fill rates (training set):")
     _any_warn = False
