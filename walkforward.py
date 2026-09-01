@@ -28,6 +28,7 @@ are comparable to what the pipeline actually emits.
     python walkforward.py --folds 2026    # just the last one
 """
 import argparse
+import json
 import sys
 import warnings
 
@@ -135,6 +136,8 @@ def main():
     ap.add_argument("--folds", type=int, nargs="*", default=[2024, 2025, 2026])
     ap.add_argument("--k", type=float, default=16.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dump-params", default=None,
+                    help="write the chosen hyperparameters per fold to this JSON")
     args = ap.parse_args()
 
     client = db.connect()
@@ -165,6 +168,18 @@ def main():
     w = np.array([r["n"] for r in rows], dtype=float)
     print(f"\npooled holdout AUC (n-weighted): {np.average(a, weights=w):.4f}")
     print(f"across folds: mean {a.mean():.4f}  sd {a.std(ddof=1) if len(a)>1 else float('nan'):.4f}")
+    if args.dump_params:
+        # The production fit takes its hyperparameters from here rather than
+        # from scoring EVAL_SEASON, so the season being predicted never
+        # influences the choice.
+        with open(args.dump_params, "w", encoding="utf-8") as f:
+            json.dump({str(r["score_season"]): {"params": r["params"],
+                                                "tune_auc": r["tune_auc"],
+                                                "holdout_auc": r["auc"]}
+                       for r in rows}, f, indent=2)
+        print("")
+        print(f"wrote {args.dump_params}")
+
     gap = np.mean([r["tune_auc"] - r["auc"] for r in rows])
     print(f"mean tune-minus-holdout gap: {gap:+.4f}  "
           "(how optimistic a single-split number is)")

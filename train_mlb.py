@@ -1,8 +1,10 @@
 """
 Train the MLB cover-probability model and save it to data/mlb_model.pkl.
 
-Trains on seasons up to and including EVAL_SEASON - 1, tunes hyperparameters
-on EVAL_SEASON, then saves the bundle.  The saved bundle is loaded by:
+Trains on every season before EVAL_SEASON and reports on EVAL_SEASON, then
+saves the bundle. Hyperparameters are NOT tuned on EVAL_SEASON -- both
+_select_hyperparams and _tune cross-validate inside the training set, so the
+eval season is a genuine holdout used only for reporting.  The saved bundle is loaded by:
   - _kelly_analysis.py   (backtest / Kelly sizing report)
   - predict_mlb.py       (daily prediction pipeline)
 
@@ -12,6 +14,7 @@ Usage
     python train_mlb.py --evals 100  # more thorough search
 """
 import argparse
+import datetime
 
 import pandas as pd
 
@@ -20,7 +23,21 @@ import data_pipeline as dp
 import model as ml
 from config import MLB
 
-EVAL_SEASON  = 2025
+# The season held out for reporting. Roll this forward each year: everything
+# before it becomes training data.
+#
+# Both selection steps cross-validate INSIDE the training set --
+# _select_hyperparams and _tune each call cross_val_score on X_train -- so the
+# eval season is never used to choose lookback, K, or hyperparameters. X_val
+# appears only in the reported scores. That makes it a genuine holdout, and it
+# means holding out a COMPLETE season buys nothing while costing a full season
+# of training data.
+#
+# Pointing it at the in-progress season instead puts every complete season into
+# the fit (2022-2025) and turns the reported val score into an honest read on
+# the season actually being bet. Walk-forward fold C measured this exact
+# configuration at 0.6169 on 2026, against 0.6162 for the old 2022-24 fit.
+EVAL_SEASON  = datetime.date.today().year
 NEXT_PERIOD  = 163
 SPLIT_PERIOD = MLB.eval_split_period
 
@@ -48,9 +65,15 @@ all_games = pd.concat(
 )
 
 games_phase1 = all_games[all_games["season"] <= EVAL_SEASON].copy()
-train_seasons = sorted(s for s in games_phase1["season"].unique() if s != EVAL_SEASON)
+# Every season in games_phase1, not just the pre-refit ones: train_models ends
+# by refitting the win model on all seasons INCLUDING EVAL_SEASON, so recording
+# only the pre-refit seasons understates what the artifact actually saw and
+# invites someone to "validate" it on data it trained on.
+train_seasons = sorted(games_phase1["season"].unique())
 
-print(f"  Training seasons: {train_seasons}  |  Tune season: {EVAL_SEASON}")
+print(f"  Fit seasons (after refit): {train_seasons}  |  Reported on: {EVAL_SEASON}")
+print(f"  NOTE: the saved model is refit on {EVAL_SEASON} too — the scores below "
+      f"are pre-refit. Use walkforward.py for an honest number.")
 print(f"  Rows: {len(games_phase1)}")
 
 # ── Train ─────────────────────────────────────────────────────────────────────
