@@ -49,6 +49,13 @@ def has_spreads(bm):
     return any(m.get("key") == "spreads" for m in bm.get("markets", []))
 
 
+def has_both(bm):
+    """Both markets from ONE book, so the run-line and moneyline arms are
+    same-book and any difference between them is the market, not the venue."""
+    ks = {m.get("key") for m in bm.get("markets", [])}
+    return {"h2h", "spreads"} <= ks
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--season", type=int, default=2025)
@@ -67,7 +74,8 @@ def main():
     finally:
         client.close()
 
-    g = games.dropna(subset=["spread_juice", "moneyline", "spreadscore", "diff"]).copy()
+    g = games.dropna(subset=["spread_juice", "moneyline", "spreadscore",
+                             "diff", "ml_odds"]).copy()
     g = g[g["spreadscore"] != 0]
     g["date_s"] = g["date"].astype(str).str[:10]
     # Spread evenly across the season rather than taking one stretch
@@ -81,6 +89,12 @@ def main():
     est = len(dates) * 20
     print(f"season {args.season}: {len(all_dates)} candidate dates, sampling {len(dates)}")
     print(f"estimated cost {est} credits (cap {args.max_credits})\n")
+    if not args.apply:
+        # Requests cost credits whether or not the rows are kept. Without this
+        # guard a "dry run" still fetched every date and threw the result away
+        # -- that mistake cost 1,400 credits before the guard existed.
+        print("DRY RUN - no requests issued. Re-run with --apply to spend.")
+        return
 
     lookup = {}
     for _, r in g.iterrows():
@@ -134,13 +148,19 @@ def main():
                 continue
             bms = game.get("bookmakers", [])
             bm = next((b for w in PREFERRED for b in bms
-                       if b.get("key") == w and has_spreads(b)), None) \
-                or next((b for b in bms if has_spreads(b)), None)
+                       if b.get("key") == w and has_both(b)), None) \
+                or next((b for b in bms if has_both(b)), None)
             if bm is None:
                 continue
             mk = {m["key"]: m for m in bm.get("markets", [])}
-            if "spreads" not in mk:
+            if "spreads" not in mk or "h2h" not in mk:
                 continue
+            # The h2h prices ride along in the same request and were previously
+            # discarded. The model bets the moneyline, so this is the arm that
+            # actually matters; the run line is the original question.
+            h2h_price = {o.get("name"): o.get("price")
+                         for o in mk["h2h"].get("outcomes", [])
+                         if o.get("name") and o.get("price") is not None}
             for o in mk["spreads"].get("outcomes", []):
                 if o.get("point") is None or o.get("price") is None:
                     continue
@@ -157,6 +177,14 @@ def main():
                     "late_price": float(o["price"]),
                     "price_5am": float(row["spread_juice"]),
                     "price_sbr_close": float(row["moneyline"]),
+                    # Moneyline arm. ml_odds is the h2h column; `moneyline` is
+                    # the legacy overloaded one and is NOT an independent
+                    # source -- odds_source reads odds-api-historical on every row.
+                    "price_5am_ml": (float(row["ml_odds"])
+                                     if pd.notna(row.get("ml_odds")) else np.nan),
+                    "late_ml_price": (float(h2h_price[o["name"]])
+                                      if o["name"] in h2h_price else np.nan),
+                    "book": bm.get("key"),
                     "minutes_before_start": round(
                         (start - snap_dt).total_seconds() / 60, 1),
                     "snapshot_ts": snap_iso,
