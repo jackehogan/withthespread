@@ -590,6 +590,7 @@ def build_features(
         def _concat(parts, y_parts):
             X = pd.concat(parts, ignore_index=True)
             _recast_categoricals(X)
+            X = _apply_feature_trim(X)
             y = pd.concat(y_parts, ignore_index=True).astype(float)
             return X, y
 
@@ -709,6 +710,7 @@ def build_features(
     def _concat(parts, y_parts):
         X = pd.concat(parts, ignore_index=True)
         _recast_categoricals(X)
+        X = _apply_feature_trim(X)
         y = pd.concat(y_parts, ignore_index=True).astype(float)
         return X, y
 
@@ -734,6 +736,53 @@ def build_features(
                   "test":  pd.Series(dtype=float),
                   "val":   pd.Series(dtype=float)}
     return X_train, X_test, y_train, y_test, X_val, y_val, style_model, _empty_win
+
+
+# ---------------------------------------------------------------------------
+# Feature trim
+# ---------------------------------------------------------------------------
+# Chosen by backward elimination in _trim_features.py, scored by
+# leave-one-season-out CV inside the TRAINING seasons only; 2026 was read once
+# at the end so it stays an honest holdout. Features were dropped in mirrored
+# pairs -- half a matchup is not a set anyone would ship.
+#
+#   full 46 features : CV 0.6366   2026 holdout 0.6126
+#   trimmed 16       : CV 0.6443   2026 holdout 0.6158
+#
+# The holdout gain is inside one SE, so this is not a performance win. It is a
+# large simplification for no cost, and it shrinks the surface hyperopt selects
+# over. Note what survived: the in-season blends (sp_era_rolling,
+# bp_whip_rolling) kept their prior-season counterparts out, which is coherent
+# -- a blend already shrinks toward the prior season, so carrying both was
+# duplication.
+#
+# Set to None to disable the trim and train on everything.
+_KEEP_FEATURES: "list[str] | None" = [
+    "1_ago_diff",
+    "bp_pitch_30d",
+    "bp_whip_rolling",
+    "elo_diff",
+    "fast_elo_diff",
+    "home",
+    "is_b2b",
+    "loss_streak",
+    "opp_1_ago_diff",
+    "opp_bp_pitch_30d",
+    "opp_bp_whip_rolling",
+    "opp_is_b2b",
+    "opp_loss_streak",
+    "opp_sp_era_rolling",
+    "opponent_elo",
+    "sp_era_rolling",
+]
+
+
+def _apply_feature_trim(X: pd.DataFrame) -> pd.DataFrame:
+    """Restrict X to _KEEP_FEATURES, preserving identifier columns."""
+    if _KEEP_FEATURES is None:
+        return X
+    keep = [c for c in X.columns if c in _KEEP_FEATURES or c == "team"]
+    return X[keep]
 
 
 def _recast_categoricals(df: pd.DataFrame) -> None:
@@ -1589,6 +1638,7 @@ def build_prediction_features(
     # caller passed style_model=None. See _USE_STYLE_EDGE.
 
     _recast_categoricals(X)
+    X = _apply_feature_trim(X)
     for col in X.columns:
         if col not in _CAT_COLS and col != "team":
             X[col] = pd.to_numeric(X[col], errors="coerce")
