@@ -105,6 +105,7 @@ def main():
     rows, spent, remaining = [], 0, None
     skipped_inplay = 0
     skipped_other_day = 0
+    skipped_ambiguous = 0
 
     for i, d in enumerate(dates, 1):
         if spent + 20 > args.max_credits:
@@ -167,6 +168,14 @@ def main():
                 cand = lookup.get((o["name"], d))
                 if not cand:
                     continue
+                if len(cand) > 1:
+                    # Doubleheader: this snapshot belongs to ONE of the day's
+                    # games and nothing here says which. Taking cand[0] attached
+                    # game 2's price to game 1 -- different starters, often a
+                    # different favourite -- and those 8% of rows manufactured
+                    # the entire "inverse steam" result. Skip rather than guess.
+                    skipped_ambiguous += 1
+                    continue
                 row = cand[0]
                 rows.append({
                     "date": d, "team": o["name"],
@@ -196,6 +205,7 @@ def main():
     print(f"\ncredits spent : {spent}   remaining: {remaining}")
     print(f"rows captured : {len(rows)}")
     print(f"skipped (already in play at snapshot): {skipped_inplay}")
+    print(f"skipped (ambiguous doubleheader pairing): {skipped_ambiguous}")
     print(f"skipped (board entry for another day): {skipped_other_day}")
 
     if not rows:
