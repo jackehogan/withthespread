@@ -305,9 +305,12 @@ def seed_mlb_season(
 
     # Team bullpen lookup
     def _bp_lookup(team: str, col: str) -> float | None:
-        if not team or bullpen_stats.empty or team not in bullpen_stats.index:
+        if not team or bullpen_stats.empty:
             return None
-        val = bullpen_stats.loc[team, col]
+        key = dp.resolve_team_key(team, bullpen_stats.index)
+        if key is None:
+            return None
+        val = bullpen_stats.loc[key, col]
         return float(val) if pd.notna(val) else None
 
     game_df["bp_era"]         = game_df["team"].apply(lambda t: _bp_lookup(t, "bp_era"))
@@ -409,8 +412,9 @@ def seed_mlb_pitcher_stats(
                         update[field] = float(stats[col])
             # Bullpen stats (team-level)
             team = row.get("team", "")
-            if team and not bullpen_stats.empty and team in bullpen_stats.index:
-                bp = bullpen_stats.loc[team]
+            _bk = dp.resolve_team_key(team, bullpen_stats.index) if not bullpen_stats.empty else None
+            if _bk is not None:
+                bp = bullpen_stats.loc[_bk]
                 # Include bp_ip_per_game — was added after 2022-2025 initial seed.
                 for col in ["bp_era", "bp_whip", "bp_k9", "bp_hr9", "bp_ip_per_game"]:
                     if col in bp.index and pd.notna(bp[col]):

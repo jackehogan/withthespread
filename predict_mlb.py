@@ -487,8 +487,9 @@ def build_upcoming_context_mlb(
 
             # Bullpen stats (prior season, team-level)
             bp_era = bp_whip = bp_k9 = bp_hr9 = bp_ip_per_game = np.nan
-            if not bullpen_stats.empty and team in bullpen_stats.index:
-                b = bullpen_stats.loc[team]
+            _bkey = dp.resolve_team_key(team, bullpen_stats.index) if not bullpen_stats.empty else None
+            if _bkey is not None:
+                b = bullpen_stats.loc[_bkey]
                 bp_ip_per_game = (float(b["bp_ip_per_game"])
                                   if pd.notna(b.get("bp_ip_per_game")) else np.nan)
                 bp_era  = float(b["bp_era"])  if pd.notna(b.get("bp_era"))  else np.nan

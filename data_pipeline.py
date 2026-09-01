@@ -1541,6 +1541,35 @@ def fetch_mlb_pitcher_stats(season: int) -> pd.DataFrame:
     return df
 
 
+# Franchises renamed inside the seeded window. Prior-season stats are filed
+# under the name in use THAT season, so looking them up by the current name
+# silently misses: 2022 Cleveland (158 rows) and 2025 Athletics (162 rows) lost
+# all five prior-season bullpen features exactly this way.
+_FRANCHISE_ALIASES = {
+    "Cleveland Guardians": ["Cleveland Indians"],
+    "Cleveland Indians":   ["Cleveland Guardians"],
+    "Athletics":           ["Oakland Athletics"],
+    "Oakland Athletics":   ["Athletics"],
+}
+
+
+def resolve_team_key(name, index) -> str | None:
+    """
+    Return `name` if it is in `index`, else the first known alias that is.
+
+    Use for every prior-season lookup keyed on team name -- a rename between
+    the stat season and the game season is otherwise a silent miss.
+    """
+    if not name:
+        return None
+    if name in index:
+        return name
+    for alt in _FRANCHISE_ALIASES.get(name, []):
+        if alt in index:
+            return alt
+    return None
+
+
 # Two starts is a sample, not a rate. At 3 this still covers 97.5% of game rows.
 _MIN_STARTS_FOR_IP_PER_START = 3
 
