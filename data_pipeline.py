@@ -34,6 +34,7 @@ import re
 import time
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 
