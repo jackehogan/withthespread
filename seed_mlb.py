@@ -431,6 +431,31 @@ def seed_mlb_pitcher_stats(
         client.close()
 
 
+# ---------------------------------------------------------------------------
+# Boxscore schema versions
+# ---------------------------------------------------------------------------
+# The boxscore seeders used to decide what still needed fetching by testing for
+# a DATA column -- first sp_ip_game, then sp_k_game, then bp_k_game. Every time
+# the extraction grew a field, rows written by the older code already had the
+# tested column and were skipped forever, silently. That is how 2026-08-27 ended
+# up with the legacy fields at 100% and every new one at 0%.
+#
+# Bump the relevant constant whenever a seeder starts writing a new field; rows
+# stamped with an older version are then re-fetched on the next run.
+_SP_BOX_SCHEMA = 2      # ip, er, k, bb, h, hr, pitches + full bullpen line
+_BP_BOX_SCHEMA = 1      # bp_ip_game only
+
+
+def _boxscore_pending(season: int, field: str, version: int) -> dict:
+    """Rows this seeder has not written at the current schema version."""
+    return {
+        "sport": "mlb", "season": season,
+        "game_pk": {"$exists": True, "$ne": ""},
+        "$or": [{field: {"$exists": False}},
+                {field: {"$lt": version}}],
+    }
+
+
 def seed_mlb_bp_fatigue(season: int, request_delay: float = 0.25) -> None:
     """
     Fetch per-game bullpen IP from statsapi boxscores and store in MongoDB.
@@ -450,14 +475,12 @@ def seed_mlb_bp_fatigue(season: int, request_delay: float = 0.25) -> None:
         # Find games missing bp_ip_game
         col = client[db._MONGO_DB]["games"]
         pending = list(col.find(
-            {"sport": "mlb", "season": season,
-             "bp_ip_game": {"$exists": False},
-             "game_pk": {"$exists": True, "$ne": ""}},
+            _boxscore_pending(season, "bp_box_v", _BP_BOX_SCHEMA),
             {"_id": 0, "team": 1, "period": 1, "game_pk": 1},
         ))
 
         if not pending:
-            print("  All games already have bp_ip_game.")
+            print(f"  All games already at bp schema v{_BP_BOX_SCHEMA}.")
             return
 
         # Unique game_pks (each game has 2 rows — home + away)
@@ -477,7 +500,8 @@ def seed_mlb_bp_fatigue(season: int, request_delay: float = 0.25) -> None:
             ops.append(UpdateOne(
                 {"sport": "mlb", "season": season,
                  "team": row["team"], "game_pk": row["game_pk"]},
-                {"$set": {"bp_ip_game": float(row["bp_ip_game"])}},
+                {"$set": {"bp_ip_game": float(row["bp_ip_game"]),
+                          "bp_box_v": _BP_BOX_SCHEMA}},
                 upsert=False,
             ))
         if ops:
@@ -513,12 +537,10 @@ def seed_mlb_sp_game_stats(season: int, request_delay: float = 0.25) -> None:
     try:
         col = client[db._MONGO_DB]["games"]
         pending = list(col.find(
-            # Keyed on sp_k_game, not sp_ip_game: rows seeded before the
-            # k/bb/h/hr extraction already have sp_ip_game and would otherwise
-            # be skipped forever.
-            {"sport": "mlb", "season": season,
-             "bp_k_game": {"$exists": False},
-             "game_pk": {"$exists": True, "$ne": ""}},
+            # Keyed on a schema VERSION, not a data column -- see
+            # _boxscore_pending. Testing for a data column skipped every row
+            # written by older code, three times running.
+            _boxscore_pending(season, "sp_box_v", _SP_BOX_SCHEMA),
             {"_id": 0, "team": 1, "period": 1, "game_pk": 1},
         ))
 
@@ -542,7 +564,8 @@ def seed_mlb_sp_game_stats(season: int, request_delay: float = 0.25) -> None:
                        "bp_h_game", "bp_hr_game", "bp_pitch_game",
                        "bp_n_relievers"]
         for _, row in sp_data.iterrows():
-            update = {"sp_ip_game": float(row["sp_ip_game"])}
+            update = {"sp_ip_game": float(row["sp_ip_game"]),
+                      "sp_box_v": _SP_BOX_SCHEMA}
             if "bp_ip_game" in row and pd.notna(row["bp_ip_game"]):
                 update["bp_ip_game"] = float(row["bp_ip_game"])
             for _f in _INT_FIELDS:
