@@ -95,7 +95,30 @@ def build(games, score_season, k):
     gg["period"] = pd.to_numeric(gg["period"], errors="coerce")
     k2 = gg.set_index(["team", "season", "period"])["game_pk"].to_dict()
     va["_pk"] = [k2.get(key, np.nan) for key in wl["keys_val"]]
+    # The 5am moneyline the pipeline actually bets into. odds_source is
+    # odds-api-historical at 08:55Z on every row, five minutes before the
+    # nightly runs, so this is a price that was really on the board.
+    k2o = gg.set_index(["team", "season", "period"])["ml_odds"].to_dict()
+    va["_ml"] = pd.to_numeric(
+        pd.Series([k2o.get(key, np.nan) for key in wl["keys_val"]]), errors="coerce")
     return tr.dropna(subset=["_y"]), va.dropna(subset=["_y", "_pk"]), feats
+
+
+def roi_table(y, p, ml, thresholds=(0.0, 0.05, 0.10, 0.20)):
+    """Flat-stake ROI at each EV threshold, one unit risked per bet."""
+    ok = np.isfinite(ml)
+    y, p, ml = y[ok], p[ok], ml[ok]
+    pay = np.where(ml > 0, ml / 100.0, 100.0 / np.abs(ml))
+    ev = p * pay - (1 - p)
+    out = []
+    for t in thresholds:
+        sel = ev > t
+        if sel.sum() < 25:
+            continue
+        pnl = np.where(y[sel] == 1, pay[sel], -1.0)
+        out.append({"thr": t, "n": int(sel.sum()), "win": float(y[sel].mean()),
+                    "roi": float(pnl.sum() / sel.sum()), "pnl": pnl})
+    return out
 
 
 def fold(games, score_season, k, rng):
@@ -125,10 +148,14 @@ def fold(games, score_season, k, rng):
     m = _fit(best, tr[feats], tr["_y"])
     p = _symmetrise(m.predict_proba(va[feats])[:, 1], va["_pk"])
     y = va["_y"].to_numpy()
+    roi = roi_table(y, p.to_numpy(), va["_ml"].to_numpy())
+    for r in roi:
+        print(f"      EV>{r['thr']:.2f}: {r['n']:>5} bets  win {r['win']*100:5.1f}%"
+              f"  ROI {r['roi']*100:+6.1f}%")
     return {"score_season": score_season, "n": len(va),
             "tune_auc": best_auc,
             "auc": roc_auc_score(y, p), "logloss": log_loss(y, p),
-            "brier": brier_score_loss(y, p), "params": best}
+            "brier": brier_score_loss(y, p), "params": best, "roi": roi}
 
 
 def main():
@@ -179,6 +206,31 @@ def main():
                        for r in rows}, f, indent=2)
         print("")
         print(f"wrote {args.dump_params}")
+
+    print("")
+    print("FLAT-STAKE ROI on untouched seasons (5am moneyline, 1u per bet)")
+    print(f"{'EV threshold':<14}" + "".join(f"{r['score_season']:>12}" for r in rows)
+          + f"{'pooled':>12}{'95% CI':>20}")
+    boot_rng = np.random.default_rng(1)
+    for t in (0.0, 0.05, 0.10, 0.20):
+        cells, pnls = [], []
+        for r in rows:
+            hit = next((x for x in r["roi"] if x["thr"] == t), None)
+            cells.append(f"{hit['roi']*100:+11.1f}%" if hit else f"{'--':>12}")
+            if hit is not None:
+                pnls.append(hit["pnl"])
+        if not pnls:
+            continue
+        allp = np.concatenate(pnls)
+        boot = [boot_rng.choice(allp, len(allp), replace=True).mean() * 100
+                for _ in range(4000)]
+        lo, hi = np.percentile(boot, [2.5, 97.5])
+        print(f"{'EV>' + format(t, '.2f'):<14}" + "".join(cells)
+              + f"{allp.mean()*100:+11.1f}%"
+              + f"   [{lo:+.1f}%, {hi:+.1f}%]".rjust(20))
+    print("  n per fold: " + ", ".join(
+        f"{r['score_season']}={next((x['n'] for x in r['roi'] if x['thr']==0.0), 0)}"
+        for r in rows))
 
     gap = np.mean([r["tune_auc"] - r["auc"] for r in rows])
     print(f"mean tune-minus-holdout gap: {gap:+.4f}  "
