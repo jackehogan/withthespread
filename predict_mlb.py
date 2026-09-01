@@ -1003,6 +1003,15 @@ def _run(
         ignore_index=True,
     )
 
+    # sp_ip_per_start arrives NaN from the stats endpoint by design -- the
+    # season-totals formula there counts relief innings against starts. Fill it
+    # from the prior season's per-game starter lines, which are the real thing.
+    pitcher_stats = dp.apply_ip_per_start(pitcher_stats, all_games, prior_season)
+    if not pitcher_stats.empty and "ip_per_start" in pitcher_stats.columns:
+        _ips = pd.to_numeric(pitcher_stats["ip_per_start"], errors="coerce")
+        print(f"  ip_per_start from per-game lines for {_ips.notna().sum()}"
+              f"/{len(pitcher_stats)} starters (max {_ips.max():.2f} IP).")
+
     # Current-season games only (for rolling features and context)
     season_games = all_games[all_games["season"] == season].copy()
 

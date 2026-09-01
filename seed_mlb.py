@@ -220,7 +220,11 @@ def seed_mlb_season(
     print(f"[3/4] Loading pitcher & bullpen stats for {season - 1} (prior season)...")
     _check_client2 = db.connect()
     try:
-        _existing_all = db.fetch_games(_check_client2, "mlb", season)
+        # All seasons: the prior season's per-game starter lines are what
+        # sp_ip_per_start is derived from, not this season's rows.
+        _all_games_db = db.fetch_games(_check_client2, "mlb")
+        _existing_all = (_all_games_db[_all_games_db["season"] == season]
+                         if not _all_games_db.empty else _all_games_db)
     finally:
         _check_client2.close()
 
@@ -265,6 +269,11 @@ def seed_mlb_season(
         bullpen_stats = dp.fetch_mlb_bullpen_stats(season - 1)
     else:
         print(f"  Loaded bullpen stats for {len(bullpen_stats)} teams from DB.")
+
+    # Recompute ip_per_start from the prior season's per-game starter lines.
+    # The DB path above re-reads whatever sp_ip_per_start was already stored,
+    # so without this the old ip/gamesStarted values propagate forward nightly.
+    pitcher_stats = dp.apply_ip_per_start(pitcher_stats, _all_games_db, season - 1)
 
     if pitcher_stats.empty:
         print("  No starter stats available — sp_era/sp_whip will be NaN.")

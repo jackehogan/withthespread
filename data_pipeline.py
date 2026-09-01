@@ -1528,10 +1528,75 @@ def fetch_mlb_pitcher_stats(season: int) -> pd.DataFrame:
     # starting roles while dropping one-game cup-of-coffee appearances.
     df = df[df["ip"] >= 10].copy()
 
-    # ip_per_start is NaN for pure relievers (gs == 0) which is fine.
-    df["ip_per_start"] = (df["ip"] / df["gs"]).where(df["gs"] > 0)
+    # ip_per_start is NOT computed here. The obvious formula, ip / gamesStarted,
+    # is wrong: `ip` is the pitcher's TOTAL innings including relief outings, so
+    # any reliever who made one start gets an absurd rate -- Keegan Akin 21.1,
+    # Jose Suarez 19.3, and a maximum of 88.0 across the seeded DB, against a
+    # physical ceiling of 9. Roughly 4-5% of rows in every season were
+    # impossible. Callers fill this from the per-game starter lines instead,
+    # via ip_per_start_from_games(); see apply_ip_per_start().
+    df["ip_per_start"] = np.nan
     df = df.drop(columns=["gs", "ip", "name"])
     return df
+
+
+# Two starts is a sample, not a rate. At 3 this still covers 97.5% of game rows.
+_MIN_STARTS_FOR_IP_PER_START = 3
+
+
+def ip_per_start_from_games(games_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Innings per start for every (pitcher, season), from the per-game lines.
+
+    Every row carrying an sp_name is exactly one start -- verified: 99.8% of
+    game_pks hold two distinct starters and no (game_pk, sp_name) repeats -- so
+    averaging sp_ip_game over a pitcher's rows is the quantity this feature was
+    always meant to be, and it is bounded by 9 innings by construction.
+
+    Returns a frame indexed by (name_key, season) with ip_per_start, n_starts.
+    """
+    need = {"sp_name", "sp_ip_game", "season"}
+    empty = pd.DataFrame(columns=["ip_per_start", "n_starts"])
+    if games_df is None or games_df.empty or not need.issubset(games_df.columns):
+        return empty
+
+    d = games_df[["sp_name", "sp_ip_game", "season"]].copy()
+    d["sp_ip_game"] = pd.to_numeric(d["sp_ip_game"], errors="coerce")
+    d = d.dropna(subset=["sp_name", "sp_ip_game", "season"])
+    d = d[d["sp_name"].astype(str).str.strip() != ""]
+    if d.empty:
+        return empty
+
+    d["name_key"] = d["sp_name"].apply(_normalize_pitcher_name)
+    grp = d.groupby(["name_key", "season"])["sp_ip_game"]
+    out = pd.DataFrame({"ip_per_start": grp.mean(), "n_starts": grp.size()})
+    return out[out["n_starts"] >= _MIN_STARTS_FOR_IP_PER_START]
+
+
+def apply_ip_per_start(
+    pitcher_stats: pd.DataFrame,
+    games_df: pd.DataFrame,
+    season: int,
+) -> pd.DataFrame:
+    """
+    Overwrite ip_per_start on a pitcher_stats frame with the per-game value
+    for `season`. Left NaN where the pitcher has too few starts to rate --
+    NaN is handled natively by the model, a wrong number is not.
+    """
+    if pitcher_stats is None or pitcher_stats.empty:
+        return pitcher_stats
+    out = pitcher_stats.copy()
+    tbl = ip_per_start_from_games(games_df)
+    if tbl.empty:
+        out["ip_per_start"] = np.nan
+        return out
+    try:
+        vals = tbl.xs(int(season), level="season")["ip_per_start"]
+    except KeyError:
+        out["ip_per_start"] = np.nan
+        return out
+    out["ip_per_start"] = out.index.map(vals)
+    return out
 
 
 def fetch_mlb_bullpen_stats(season: int) -> pd.DataFrame:
