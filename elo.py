@@ -1,285 +1,237 @@
 """
-Elo rating sub-model based on raw point differential.
+Elo rating sub-model based on raw run differential.
 
-Why point differential (not SpreadScore)
------------------------------------------
-SpreadScore incorporates the betting spread, which moves based on public money
-flow. A popular team may have an inflated spread regardless of true quality.
-Point differential is a pure performance signal — market-independent — which
-complements the SpreadScore rolling features already in the main model.
+Design
+------
+Ratings are sequential with no window. K alone sets how fast the past is
+forgotten -- a hard window is a second, redundant memory that fights K, and
+measurement showed every finite window loses to unlimited history at every K
+tested. See the parameter notes below.
 
-Rating update
--------------
-Instead of binary win/loss, we use a continuous outcome score derived from
-the point differential via a sigmoid:
+Update, per game, from the home side's perspective:
 
-    S_team = 1 / (1 + exp(-diff / scale))
+    E_home  = 1 / (1 + 10^((R_away - (R_home + HFA)) / 400))
+    S_home  = 1 if the home team won, else 0
+    delta   = K * (S_home - E_home)
+    R_home += delta
+    R_away -= delta
 
-A blowout win (+25) → S ≈ 0.85
-A narrow win  (+3)  → S ≈ 0.55
-A blowout loss(-25) → S ≈ 0.15
+The update is zero-sum, so the league total never drifts from 30 * 1500.
 
-Then the standard Elo update:
+Home-field advantage enters the EXPECTATION only. It is never stored in a
+rating, so ratings stay pure team strength, and the reported `elo_diff` is the
+raw rating gap with no home term folded in -- the model already has a `home`
+feature and would otherwise double-count it.
 
-    E_team = 1 / (1 + 10^((opp_elo - team_elo) / 400))
-    new_elo = old_elo + K * (S_team - E_team)
+Season boundaries
+-----------------
+Ratings regress toward the mean between seasons rather than resetting flat:
 
-Season reset
-------------
-Ratings reset to `initial_rating` (1500) at the start of each season.
-This avoids stale ratings carrying over when rosters change significantly.
+    R_start = 1500 + carry * (R_end - 1500)
+
+carry=0 is a full reset, carry=1 keeps everything. Teams absent from the prior
+season start at 1500.
+
+Parameter choices
+-----------------
+K=6, carry=0.5, HFA=20 were selected on 2022-2025 and confirmed by
+walk-forward validation across 2023-2026 (~8,000 out-of-sample games), where
+every fold independently selected no window and three of four selected
+carry=0.5. Two independent criteria agreed on K=6: best log loss, and a
+realised-versus-claimed slope ratio of 1.000 (the effect of a rating gap
+matches what the 400-scale asserts).
+
+HFA=20 is not fitted so much as implied -- home teams win 52.99% of games, and
+400 * log10(.5299/.4701) = 20.8 rating points.
+
+Expect out-of-sample AUC near 0.57 against the win label, not the 0.583 the
+tuning seasons suggest; walk-forward showed the tuned configuration performs no
+better than this fixed one, so the constants are deliberately not searched.
 
 Features produced
 -----------------
-    elo_diff    : team_elo - opponent_elo  (relative strength)
-    opponent_elo: opponent's absolute rating (quality of opposition)
+    elo        : team's rating BEFORE this game
+    opp_elo    : opponent's rating BEFORE this game
+    elo_diff   : elo - opp_elo
 
-Pre-game ratings are stored — the rating reflects what we knew *before*
-the game, so there is no lookahead leakage.
-
-K tuning
---------
-K controls how fast ratings move. Candidates [16, 32, 48, 64] are searched
-via cross-validation in model._select_k() alongside lookback selection.
+Pre-game ratings are recorded before the result is applied, so a game never
+informs its own features.
 
 Public interface
 ----------------
-compute(games_df, k, initial_rating, scale) -> pd.DataFrame
-    Returns DataFrame indexed by (team, season, period) with columns:
-    elo, opp_elo, elo_diff
+compute(games_df, k, carry, hfa, initial_rating) -> pd.DataFrame
+    Indexed by (team, season, period), columns: elo, opp_elo, elo_diff
 """
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import pandas as pd
 
-_INITIAL_RATING = 1500
-_SCALE          = 15    # point diff at which sigmoid ≈ 0.73 (roughly one possession)
+_INITIAL_RATING = 1500.0
+_K = 6.0
+_CARRY = 0.5
+_HFA = 20.0
+
+# Franchises that changed name mid-history. Without canonicalising, carryover
+# treats the renamed club as brand new and resets it to the initial rating.
+_CANON = {"Oakland Athletics": "Athletics"}
+
+
+def _game_table(games_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse team-perspective rows into one row per game, home side's view.
+
+    Each game normally appears twice, once per team. A handful have only one
+    perspective stored; those are recovered from whichever row exists.
+    """
+    df = games_df.dropna(subset=["opponent", "diff"]).copy()
+    # Canonical names drive the ratings so a renamed franchise keeps its history.
+    # The ORIGINAL names are carried alongside and used for the output index, or
+    # the caller's (team, season, period) keys would stop matching.
+    df["_team_c"] = df["team"].replace(_CANON)
+    df["_opp_c"] = df["opponent"].replace(_CANON)
+
+    has_home = "home" in df.columns and df["home"].notna().any()
+    if not has_home:
+        # No home flag: treat every row as its own perspective and de-duplicate
+        # on the unordered pair so each game is applied once.
+        df["_pair"] = [tuple(sorted(p)) for p in zip(df["_team_c"], df["_opp_c"])]
+        df = df.drop_duplicates(subset=["season", "_pair", "period"], keep="first")
+        df["home_team"] = df["_team_c"]
+        df["away_team"] = df["_opp_c"]
+        df["home_name"] = df["team"]
+        df["away_name"] = df["opponent"]
+        df["home_margin"] = pd.to_numeric(df["diff"], errors="coerce")
+        df["home_period"] = df["period"]
+        df["away_period"] = np.nan
+        return df
+
+    rows = []
+    key = "game_pk" if "game_pk" in df.columns else None
+    if key is None:
+        df["game_pk"] = [f"{s}-{'-'.join(sorted(p))}-{pd_}" for s, p, pd_ in
+                         zip(df["season"],
+                             zip(df["team"], df["opponent"]),
+                             df["period"])]
+        key = "game_pk"
+
+    for _, blk in df.groupby(key, sort=False):
+        h = blk[blk["home"] == 1]
+        a = blk[blk["home"] != 1]
+        if len(h):
+            r = h.iloc[0]
+            home_team, away_team = r["_team_c"], r["_opp_c"]
+            home_name, away_name = r["team"], r["opponent"]
+            margin = float(r["diff"])
+            hp = r["period"]
+            ap = a.iloc[0]["period"] if len(a) else np.nan
+            date = r.get("date")
+            season = r["season"]
+        else:                                   # orphan: only the away row exists
+            r = a.iloc[0]
+            home_team, away_team = r["_opp_c"], r["_team_c"]
+            home_name, away_name = r["opponent"], r["team"]
+            margin = -float(r["diff"])
+            hp = np.nan
+            ap = r["period"]
+            date = r.get("date")
+            season = r["season"]
+        rows.append((season, date, r.get("game_pk"), home_team, away_team,
+                     home_name, away_name, margin, hp, ap))
+
+    out = pd.DataFrame(rows, columns=["season", "date", "game_pk", "home_team",
+                                      "away_team", "home_name", "away_name",
+                                      "home_margin", "home_period",
+                                      "away_period"])
+    return out
 
 
 def compute(
     games_df: pd.DataFrame,
-    k: float = 32,
-    window: int = 20,
+    k: float = _K,
+    carry: float = _CARRY,
+    hfa: float = _HFA,
     initial_rating: float = _INITIAL_RATING,
-    scale: float = _SCALE,
-    value_col: str = "diff",
 ) -> pd.DataFrame:
     """
-    Compute pre-game Elo ratings for every (team, season, period).
+    Pre-game Elo ratings for every (team, season, period).
 
     Parameters
     ----------
-    games_df       : DataFrame with columns team, opponent, season, period, diff.
-    k              : rating sensitivity — how much ratings move per game.
-    window         : number of most recent games used to compute the rating.
-                     EDA showed a 20-game window has ~8x the predictive signal
-                     of full-season cumulative Elo (cover gap +0.49 vs +0.03).
-                     Full-season cumulative is equivalent to window=None.
-    initial_rating : starting rating each season.
-    scale          : point diff divisor in sigmoid (higher = less sensitive to margins).
-    value_col      : outcome column driving the update.
-                     "diff"        -> rates who WINS (pure performance).
-                     "spreadscore" -> rates who COVERS the run line, which is
-                                      what the model actually predicts. Since
-                                      the MLB run line is fixed at +/-1.5,
-                                      spreadscore is diff offset by favourite
-                                      status, so this credits underdogs for
-                                      keeping games close and penalises
-                                      favourites for narrow wins.
-
-    Returns
-    -------
-    DataFrame indexed by (team, season, period) with columns:
-        elo         : team's Elo BEFORE this game
-        opp_elo     : opponent's Elo BEFORE this game
-        elo_diff    : elo - opp_elo
-    """
-    needed = {"team", "opponent", "season", "period", value_col}
-    if not needed.issubset(games_df.columns):
-        raise ValueError(f"games_df missing columns: {needed - set(games_df.columns)}")
-
-    df = (
-        games_df[list(needed)]
-        .dropna(subset=["opponent", value_col])
-        .sort_values(["season", "period"])
-        .copy()
-    )
-
-    records: list[dict] = []
-
-    for season, season_df in df.groupby("season"):
-        # game_log stores unique games in order: (period, team, opp, diff)
-        # Used for windowed recompute; team perspective only (opp diff = -diff).
-        game_log: list[tuple] = []
-        seen_games: set[tuple] = set()
-
-        # Cumulative ratings used only when window is None
-        cum_ratings: dict[str, float] = {}
-
-        for period, period_df in season_df.groupby("period"):
-
-            # NOTE: game_log is populated AFTER recording pre-game ratings so
-            # that the current period's outcomes are never included in the Elo
-            # features for that same period (no lookahead into the label).
-
-            if window is not None:
-                # Recompute from scratch over the last `window` unique games
-                # (all from *prior* periods — current period not yet appended).
-                # This gives each team a rating reflecting only recent form.
-                recent = game_log[-window:]
-                fresh: dict[str, float] = {}
-                for (_, t, o, d) in recent:
-                    r_t = fresh.get(t, initial_rating)
-                    r_o = fresh.get(o, initial_rating)
-                    s_t = 1.0 / (1.0 + math.exp(-d / scale))
-                    e_t = 1.0 / (1.0 + 10 ** ((r_o - r_t) / 400))
-                    fresh[t] = r_t + k * (s_t - e_t)
-                    fresh[o] = r_o + k * ((1 - s_t) - (1 - e_t))
-                pre = {t: fresh.get(t, initial_rating) for t in
-                       set(r["team"] for _, r in period_df.iterrows()) |
-                       set(r["opponent"] for _, r in period_df.iterrows())}
-            else:
-                # Standard cumulative: carry ratings forward from last period
-                pre = {}
-                for _, row in period_df.iterrows():
-                    pre[row["team"]]     = cum_ratings.get(row["team"],     initial_rating)
-                    pre[row["opponent"]] = cum_ratings.get(row["opponent"], initial_rating)
-
-            # Record pre-game ratings (current period NOT yet in game_log)
-            for _, row in period_df.iterrows():
-                team = row["team"]
-                opp  = row["opponent"]
-                records.append({
-                    "team":     team,
-                    "season":   season,
-                    "period":   period,
-                    "elo":      pre.get(team, initial_rating),
-                    "opp_elo":  pre.get(opp,  initial_rating),
-                    "elo_diff": pre.get(team, initial_rating) - pre.get(opp, initial_rating),
-                })
-
-            # NOW append current period's games to game_log so they are
-            # available as prior history for future periods only.
-            for _, row in period_df.iterrows():
-                team = row["team"]
-                opp  = row["opponent"]
-                key  = tuple(sorted([team, opp]))
-                game_key = (period, key)
-                if game_key not in seen_games:
-                    seen_games.add(game_key)
-                    game_log.append((period, team, opp, float(row[value_col])))
-
-            # Update cumulative ratings (only used when window=None)
-            if window is None:
-                processed: set[tuple] = set()
-                for _, row in period_df.iterrows():
-                    team = row["team"]
-                    opp  = row["opponent"]
-                    key  = tuple(sorted([team, opp]))
-                    if key in processed:
-                        continue
-                    processed.add(key)
-                    r_t  = pre[team];  r_o = pre[opp]
-                    d    = float(row[value_col])
-                    s_t  = 1.0 / (1.0 + math.exp(-d / scale))
-                    e_t  = 1.0 / (1.0 + 10 ** ((r_o - r_t) / 400))
-                    cum_ratings[team] = r_t + k * (s_t - e_t)
-                    cum_ratings[opp]  = r_o + k * ((1 - s_t) - (1 - e_t))
-
-    return (
-        pd.DataFrame(records)
-        .set_index(["team", "season", "period"])
-        [["elo", "opp_elo", "elo_diff"]]
-    )
-
-
-# ---------------------------------------------------------------------------
-# Per-team short window
-# ---------------------------------------------------------------------------
-
-_CANON_PT = {"Oakland Athletics": "Athletics"}
-
-
-def compute_per_team(
-    games_df: pd.DataFrame,
-    k: float = 16.0,
-    n: int = 1,
-    initial_rating: float = _INITIAL_RATING,
-    scale: float = _SCALE,
-) -> pd.DataFrame:
-    """
-    Deterministic per-team version of the league-wide window.
-
-    The windowed branch of compute() slices `game_log`, which holds every game
-    in the league, so window=20 is roughly ONE round of play and the number of
-    games a given team actually has inside it (1 or 2) is decided by where the
-    schedule places them in the period ordering. Measured against a per-team
-    window it correlates 0.784 at N=1, falling monotonically thereafter -- so
-    it behaves like "this team's last game", with scheduling noise on top.
-
-    This computes that intent directly: replay from `initial_rating` over the
-    team's own last `n` games, opponents held at `initial_rating` so there is
-    no opponent adjustment -- matching the league-wide replay, where every team
-    re-enters at 1500 and the expected score never leaves 0.493-0.507.
-
-    Returns the same shape as compute(): indexed by (team, season, period)
-    with columns elo, opp_elo, elo_diff.
+    games_df       : columns team, opponent, season, period, diff; `home`,
+                     `date` and `game_pk` are used when present.
+    k              : rating sensitivity. Also the memory: a game's influence
+                     half-lives in roughly 481/k games.
+    carry          : fraction of end-of-season rating carried into the next.
+    hfa            : home-field advantage in rating points, applied to the
+                     expectation only and never stored.
+    initial_rating : rating for a team with no history.
     """
     needed = {"team", "opponent", "season", "period", "diff"}
     missing = needed - set(games_df.columns)
     if missing:
         raise ValueError(f"games_df missing columns: {missing}")
 
-    df = games_df.dropna(subset=["opponent", "diff"]).copy()
-    df["_t"] = df["team"].replace(_CANON_PT)
-    df["_o"] = df["opponent"].replace(_CANON_PT)
-    df["_d"] = pd.to_numeric(df["diff"], errors="coerce")
-    df = df.dropna(subset=["_d"])
-    df = df.sort_values(["season", "period"], kind="mergesort")
+    g = _game_table(games_df)
+    if g.empty:
+        return pd.DataFrame(
+            columns=["elo", "opp_elo", "elo_diff"],
+            index=pd.MultiIndex.from_arrays([[], [], []],
+                                            names=["team", "season", "period"]),
+        )
 
-    # Rating each team would carry into each of its own games.
-    hist: dict[tuple, list] = {}
-    rating = np.full(len(df), float(initial_rating))
-    t_arr = df["_t"].to_numpy()
-    s_arr = df["season"].to_numpy()
-    d_arr = df["_d"].to_numpy(dtype=float)
-
-    for i in range(len(df)):
-        key = (t_arr[i], s_arr[i])
-        prior = hist.get(key, [])
-        r = float(initial_rating)
-        for dd in prior[-n:]:
-            s_score = 1.0 / (1.0 + math.exp(-dd / scale))
-            e = 1.0 / (1.0 + 10 ** ((initial_rating - r) / 400.0))
-            r += k * (s_score - e)
-        rating[i] = r
-        hist.setdefault(key, []).append(d_arr[i])
-
-    df["_r"] = rating
-    own = df.set_index(["_t", "season", "period"])["_r"]
-
-    # The opponent's rating comes from ITS OWN row for the same game, which
-    # carries a different period, so pair on game_pk where available.
-    if "game_pk" in df.columns and df["game_pk"].notna().any():
-        pair = df.set_index(["game_pk", "_t"])["_r"]
-        opp_r = []
-        for gp, o in zip(df["game_pk"], df["_o"]):
-            opp_r.append(pair.get((gp, o), np.nan))
-        df["_ro"] = opp_r
+    # Chronological order. `period` is a per-team game counter, so it orders a
+    # single team correctly but is not comparable across teams; date is the
+    # league-wide clock, with game_pk breaking doubleheader ties.
+    sort_cols = ["season"]
+    if "date" in g.columns and g["date"].notna().any():
+        sort_cols.append("date")
+    if "game_pk" in g.columns:
+        g["_pk"] = pd.to_numeric(g["game_pk"], errors="coerce")
+        sort_cols.append("_pk")
     else:
-        df["_ro"] = own.reindex(pd.MultiIndex.from_arrays(
-            [df["_o"], df["season"], df["period"]])).to_numpy()
+        sort_cols.append("home_period")
+    g = g.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
-    out = pd.DataFrame({
-        "team": df["team"].to_numpy(),
-        "season": df["season"].to_numpy(),
-        "period": df["period"].to_numpy(),
-        "elo": df["_r"].to_numpy(),
-        "opp_elo": df["_ro"].to_numpy(),
-    })
-    out["elo_diff"] = out["elo"] - out["opp_elo"]
+    ratings: dict[str, float] = {}
+    prev_season = None
+    records: list[dict] = []
+
+    seasons = g["season"].to_numpy()
+    homes = g["home_team"].to_numpy()
+    aways = g["away_team"].to_numpy()
+    hname = g["home_name"].to_numpy()
+    aname = g["away_name"].to_numpy()
+    margins = g["home_margin"].to_numpy(dtype=float)
+    hper = g["home_period"].to_numpy()
+    aper = g["away_period"].to_numpy()
+
+    for i in range(len(g)):
+        season = seasons[i]
+        if season != prev_season:
+            ratings = {t: initial_rating + carry * (r - initial_rating)
+                       for t, r in ratings.items()}
+            prev_season = season
+
+        h, a = homes[i], aways[i]
+        rh = ratings.get(h, initial_rating)
+        ra = ratings.get(a, initial_rating)
+
+        # Record pre-game state for both sides before the result is applied.
+        if hper[i] == hper[i]:                              # not NaN
+            records.append({"team": hname[i], "season": season, "period": hper[i],
+                            "elo": rh, "opp_elo": ra, "elo_diff": rh - ra})
+        if aper[i] == aper[i]:
+            records.append({"team": aname[i], "season": season, "period": aper[i],
+                            "elo": ra, "opp_elo": rh, "elo_diff": ra - rh})
+
+        e_home = 1.0 / (1.0 + 10 ** ((ra - (rh + hfa)) / 400.0))
+        s_home = 1.0 if margins[i] > 0 else 0.0
+        delta = k * (s_home - e_home)
+        ratings[h] = rh + delta
+        ratings[a] = ra - delta
+
+    out = pd.DataFrame.from_records(records)
+    out["period"] = pd.to_numeric(out["period"], errors="coerce").astype("int64")
     return out.set_index(["team", "season", "period"])[["elo", "opp_elo", "elo_diff"]]

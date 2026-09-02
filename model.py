@@ -58,13 +58,20 @@ _LOOKBACK_CANDIDATES     = [7, 10, 15]
 # realised-vs-claimed slope ratio -- both landed on 6. The list is kept at
 # length one so the surrounding search plumbing and the saved bundle format
 # stay unchanged. See elo.py for the derivation.
-_K_CANDIDATES            = [16.0]
+# K=6 was selected on 2022-2025 and confirmed by walk-forward over 2023-2026
+# in commit 0bd94eb, by two independent criteria: best log loss, and a
+# realised-vs-claimed slope ratio of 1.000. It was silently reset to 16 when
+# elo.py was reverted inside f02ecfa ("Give every feature a matchup edge").
+_K_CANDIDATES            = [6.0]
 # Second Elo at a faster K, giving the tree two memory horizons instead of one.
 # The pre-rebuild model carried two (window 20 and window 40) and scored
 # win_val_roc 0.615; collapsing to a single rating dropped it to 0.562. This is
 # the ablation for whether the second horizon was what mattered. K=24 half-lives
 # in roughly 20 games against K=6's 80. Set to None to disable.
-_FAST_ELO_K              = 24.0
+# fast_elo_diff was a SECOND league-wide-windowed rating. elo.compute no longer
+# takes a window at all, so there is no second horizon to build it from, and it
+# was the worst offender in the truncation test -- values moved by up to 10.6
+# Elo points when future games were removed. Removed entirely.
 
 # How a feature's matchup information is presented to the tree.
 #   "edge" : own value + (opponent - own), the differenced form
@@ -131,7 +138,6 @@ def _matchup_extra_features() -> list:
 # feature set exactly -- elo_diff at the league-wide window 20, plus a second
 # rating at window 40 standing in for long_elo_diff/long_opp_elo -- to test
 # whether reverting the rating recovers win_val_roc 0.615.
-_REVERT_TEST_WINDOW      = 40
 _BP_FATIGUE_DAYS         = 14    # fixed rolling window for bp_ip_14d — not a hyperparameter
 
 # Bullpen workload window and rate shrinkage, both swept on 2022-2026 and scored
@@ -326,11 +332,6 @@ def _precompute(
     eval_elo_by_k  = {}
     for k in k_values:
         er = elo_mod.compute(games_df, k=k)
-        if _FAST_ELO_K is not None:
-            _fast = elo_mod.compute(games_df, k=k, window=_REVERT_TEST_WINDOW)
-            er = er.join(_fast[["elo_diff", "opp_elo"]]
-                         .rename(columns={"elo_diff": "fast_elo_diff",
-                                          "opp_elo": "fast_opp_elo"}))
         elo_by_k[k]       = er
         _eval_mask = er.index.get_level_values("season") == eval_season
         train_elo_by_k[k] = er[~_eval_mask]
@@ -426,18 +427,13 @@ def _precompute(
         _CTX = [c for c in _CTX if c not in _MARKET_FEATURES]
 
     def _add_elo(df_base, common, elo_by_p, target):
-        """Return (elo_diff, opponent_elo, fast_elo_diff, fast_opp_elo)."""
+        """Return (elo_diff, opponent_elo)."""
         _nan = np.full(len(common), np.nan)
         elo_grp = elo_by_p.get(target)
         if elo_grp is None:
-            return _nan, _nan, _nan, _nan
+            return _nan, _nan
         ea = elo_grp.reindex(common)
-        return (
-            ea["elo_diff"].values,
-            ea["opp_elo"].values,
-            ea["fast_elo_diff"].values if "fast_elo_diff" in ea.columns else _nan,
-            ea["fast_opp_elo"].values if "fast_opp_elo" in ea.columns else _nan,
-        )
+        return ea["elo_diff"].values, ea["opp_elo"].values
 
     for target in all_targets:
         # --- train split ---
@@ -459,8 +455,7 @@ def _precompute(
                 y_cov_tr, y_win_tr = _cover_and_win_labels(y_tr, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
-                    (df_k["elo_diff"], df_k["opponent_elo"],
-                     df_k["fast_elo_diff"], df_k["fast_opp_elo"]) = _add_elo(
+                    (df_k["elo_diff"], df_k["opponent_elo"]) = _add_elo(
                         base, common, train_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
@@ -487,8 +482,7 @@ def _precompute(
                 y_cov_ev, y_win_ev = _cover_and_win_labels(y_ev, _ctx_al)
                 for k in k_values:
                     df_k = base.copy()
-                    (df_k["elo_diff"], df_k["opponent_elo"],
-                     df_k["fast_elo_diff"], df_k["fast_opp_elo"]) = _add_elo(
+                    (df_k["elo_diff"], df_k["opponent_elo"]) = _add_elo(
                         base, common, eval_elo_by_k_p[k], target)
                     _recast_categoricals(df_k)
                     for col in df_k.columns:
@@ -639,11 +633,6 @@ def build_features(
         eval_ctx  = context[context.index.get_level_values("season") == eval_season]
 
         elo_ratings = elo_mod.compute(games_df, k=best_k)
-        if _FAST_ELO_K is not None:
-            _f = elo_mod.compute(games_df, k=best_k, window=_REVERT_TEST_WINDOW)
-            elo_ratings = elo_ratings.join(
-                _f[["elo_diff", "opp_elo"]].rename(
-                    columns={"elo_diff": "fast_elo_diff", "opp_elo": "fast_opp_elo"}))
         train_elo   = elo_ratings[
             ~elo_ratings.index.get_level_values("season").isin([eval_season])
         ]
@@ -762,7 +751,6 @@ _KEEP_FEATURES: "list[str] | None" = [
     "bp_pitch_30d",
     "bp_whip_rolling",
     "elo_diff",
-    "fast_elo_diff",
     "home",
     "is_b2b",
     "loss_streak",
@@ -1183,7 +1171,7 @@ def _compute_sp_rolling_era(
     for (sp_name, season_val), grp in df.groupby(["sp_name", "season"]):
         if not sp_name:
             continue
-        grp = grp.sort_values("date").reset_index(drop=True)
+        grp = grp.sort_values(["date", "period"], kind="mergesort").reset_index(drop=True)
 
         for i, row in grp.iterrows():
             key = (row["team"], season_val, int(row["period"]))
@@ -1283,7 +1271,11 @@ def _compute_bp_rolling_rate(games_df: pd.DataFrame, rate: str) -> pd.Series:
 
     out = []
     for (team, season_val), grp in d.groupby(["team", "season"], sort=False):
-        grp = grp.sort_values("date")
+        grp = grp.sort_values(["date", "period"], kind="mergesort")
+        # Stable, and period breaks the tie: pandas sorts with a NON-stable
+        # quicksort by default, so the two halves of a doubleheader could be
+        # ordered either way between builds -- letting game 2 be counted
+        # before game 1. A truncation test caught it as phantom lookahead.
         cip = cnum = 0.0
         for _, r in grp.iterrows():
             std = (cnum * mult / cip) if cip > 0 else np.nan
@@ -1525,14 +1517,9 @@ def _collect_window(
         elo_aligned  = elo_slice.reindex(common_idx)
         df["elo_diff"]     = elo_aligned["elo_diff"].values
         df["opponent_elo"] = elo_aligned["opp_elo"].values
-        for _c in ("fast_elo_diff", "fast_opp_elo"):
-            df[_c] = (elo_aligned[_c].values
-                      if _c in elo_aligned.columns else np.nan)
     except KeyError:
         df["elo_diff"]     = np.nan
         df["opponent_elo"] = np.nan
-        df["fast_elo_diff"] = np.nan
-        df["fast_opp_elo"]  = np.nan
 
     _recast_categoricals(df)
     for col in df.columns:
@@ -1614,11 +1601,7 @@ def build_prediction_features(
     # Must mirror _precompute exactly — a column present in training but missing
     # here would silently become NaN for every team.
     elo_df = elo_mod.compute(completed, k=best_k)
-    if _FAST_ELO_K is not None:
-        _f = elo_mod.compute(completed, k=best_k, window=_REVERT_TEST_WINDOW)
-        elo_df = elo_df.join(_f[["elo_diff", "opp_elo"]].rename(
-            columns={"elo_diff": "fast_elo_diff", "opp_elo": "fast_opp_elo"}))
-    _elo_cols = ["elo", "opp_elo", "elo_diff", "fast_elo_diff", "fast_opp_elo"]
+    _elo_cols = ["elo", "opp_elo", "elo_diff"]
     latest_elo = (
         elo_df.reset_index()
         .sort_values("period")
@@ -1628,9 +1611,6 @@ def build_prediction_features(
     )
     X["elo_diff"]     = X["team"].map(latest_elo["elo_diff"])
     X["opponent_elo"] = X["team"].map(latest_elo["opp_elo"])
-    for _c in ("fast_elo_diff", "fast_opp_elo"):
-        X[_c] = (X["team"].map(latest_elo[_c])
-                 if _c in latest_elo.columns else np.nan)
 
     # style_edge is not produced. It contributed nothing to the model, and
     # fitting the StyleModel here meant a full SVD of the season's matchup
