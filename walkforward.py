@@ -161,7 +161,7 @@ def fold(games, score_season, k, rng):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--folds", type=int, nargs="*", default=[2024, 2025, 2026])
-    ap.add_argument("--k", type=float, default=16.0)
+    ap.add_argument("--k", type=float, default=ml._K_CANDIDATES[0])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dump-params", default=None,
                     help="write the chosen hyperparameters per fold to this JSON")
