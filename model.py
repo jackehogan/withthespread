@@ -730,37 +730,38 @@ def build_features(
 # ---------------------------------------------------------------------------
 # Feature trim
 # ---------------------------------------------------------------------------
-# Chosen by backward elimination in _trim_features.py, scored by
-# leave-one-season-out CV inside the TRAINING seasons only; 2026 was read once
-# at the end so it stays an honest holdout. Features were dropped in mirrored
-# pairs -- half a matchup is not a set anyone would ship.
+# Chosen by backward elimination in _trim_features.py, re-run 2026-09-01 from
+# the full 44 candidates AFTER the Elo leak was removed. Scored by
+# leave-one-season-out CV inside the training seasons (2022-2025); 2026 was read
+# once at the end. Features are dropped in mirrored pairs -- half a matchup is
+# not a set anyone would ship.
 #
-#   full 46 features : CV 0.6366   2026 holdout 0.6126
-#   trimmed 16       : CV 0.6443   2026 holdout 0.6158
+#   full 44 features : CV 0.5855   2026 holdout 0.5570
+#   trimmed 10       : CV 0.5997   2026 holdout 0.5659
 #
-# The holdout gain is inside one SE, so this is not a performance win. It is a
-# large simplification for no cost, and it shrinks the surface hyperopt selects
-# over. Note what survived: the in-season blends (sp_era_rolling,
-# bp_whip_rolling) kept their prior-season counterparts out, which is coherent
-# -- a blend already shrinks toward the prior season, so carrying both was
-# duplication.
+# The previous 15-feature set was selected against a LEAKING Elo, so re-running
+# had to start from the full candidate list -- otherwise a feature that earns
+# its place now could never come back. bp_era and bp_ip_14d did exactly that,
+# while opponent_elo, is_b2b, 1_ago_diff, loss_streak and bp_whip_rolling
+# dropped out. opponent_elo going is the coherent one: with a real rating,
+# elo_diff already carries the comparison, so the absolute opponent level is
+# redundant. It only survived before because the windowed rating was so
+# compressed (sd 1.35) that level and difference held different information.
+#
+# This is parsimony, not performance -- 0.5659 against 0.5668 for the 15-feature
+# set is a wash, and both sit below the market's 0.5722 on 2026.
 #
 # Set to None to disable the trim and train on everything.
 _KEEP_FEATURES: "list[str] | None" = [
-    "1_ago_diff",
+    "bp_era",
+    "bp_ip_14d",
     "bp_pitch_30d",
-    "bp_whip_rolling",
     "elo_diff",
     "home",
-    "is_b2b",
-    "loss_streak",
-    "opp_1_ago_diff",
+    "opp_bp_era",
+    "opp_bp_ip_14d",
     "opp_bp_pitch_30d",
-    "opp_bp_whip_rolling",
-    "opp_is_b2b",
-    "opp_loss_streak",
     "opp_sp_era_rolling",
-    "opponent_elo",
     "sp_era_rolling",
 ]
 

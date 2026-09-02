@@ -2,7 +2,7 @@
 Backward feature elimination for the MLB win model.
 
 Selection is scored by leave-one-season-out CV **inside the training seasons
-(2022-24) only**. 2026 is touched exactly once, at the end, as a clean read --
+only**. 2026 is touched exactly once, at the end, as a clean read --
 selecting on it would burn the only holdout that has never been used, which is
 precisely what made 2025 unusable as an honest number.
 
@@ -66,7 +66,7 @@ def holdout_auc(tr, ho, cols, params):
 
 
 def main():
-    with open(D + r"\matrices.pkl", "rb") as f:
+    with open(D + r"\matrices2.pkl", "rb") as f:
         M = pickle.load(f)
     tr, ho, feats = M["train"], M["holdout"], M["features"]
     params = {k: v for k, v in M["params"].items() if k in KEEP_PARAMS and v is not None}
