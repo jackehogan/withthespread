@@ -995,10 +995,12 @@ def fetch_mlb_odds_espn(
 _SBR_URL = "https://www.sportsbookreview.com/betting-odds/mlb-baseball/pointspread/full-game/?date={date}"
 _SBR_HDRS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
+# NOTE: "Athletics" is deliberately NOT mapped to "Oakland Athletics" here.
+# The DB stores "Oakland Athletics" through 2024 and "Athletics" from 2025, so
+# an unconditional rewrite breaks the later era. Callers resolve the rename via
+# _FRANCHISE_ALIASES / resolve_team_key instead.
 _SBR_TEAM_FIX: dict[str, str] = {
     "Cleveland Indians":    "Cleveland Guardians",
-    "Oakland Athletics":    "Oakland Athletics",
-    "Athletics":            "Oakland Athletics",
     "Tampa Bay Devil Rays": "Tampa Bay Rays",
     "Anaheim Angels":       "Los Angeles Angels",
     "Florida Marlins":      "Miami Marlins",

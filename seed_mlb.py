@@ -180,14 +180,34 @@ def seed_mlb_season(
                        [["run_line", "spread_juice", "ml_odds", "snapshot_ts"]]
                        .to_dict("index")
             )
-            keys = list(zip(game_df["team"], game_df["date"]))
-            game_df["spread"]       = [odds_map.get(k, {}).get("run_line")     for k in keys]
-            game_df["spread_juice"] = [odds_map.get(k, {}).get("spread_juice") for k in keys]
-            game_df["ml_odds"]      = [odds_map.get(k, {}).get("ml_odds")      for k in keys]
-            game_df["snapshot_ts"]  = [odds_map.get(k, {}).get("snapshot_ts")  for k in keys]
+            # The odds feed keys on ITS name for a club, which can lag a
+            # rename: 2025 Athletics matched 3 of 162 games because the API
+            # still said "Oakland Athletics" while the DB had switched. Fall
+            # back to known aliases rather than silently dropping the side.
+            _alias_hits = 0
+
+            def _odds_rec(team, date):
+                nonlocal _alias_hits
+                rec = odds_map.get((team, date))
+                if rec is not None:
+                    return rec
+                for _alt in dp._FRANCHISE_ALIASES.get(team, []):
+                    rec = odds_map.get((_alt, date))
+                    if rec is not None:
+                        _alias_hits += 1
+                        return rec
+                return None
+
+            recs = [_odds_rec(t, d) for t, d in zip(game_df["team"], game_df["date"])]
+            game_df["spread"]       = [(r or {}).get("run_line")     for r in recs]
+            game_df["spread_juice"] = [(r or {}).get("spread_juice") for r in recs]
+            game_df["ml_odds"]      = [(r or {}).get("ml_odds")      for r in recs]
+            game_df["snapshot_ts"]  = [(r or {}).get("snapshot_ts")  for r in recs]
             game_df["odds_source"]  = [
-                "odds-api-historical" if k in odds_map else None for k in keys
+                "odds-api-historical" if r is not None else None for r in recs
             ]
+            if _alias_hits:
+                print(f"  Matched {_alias_hits} row(s) via a franchise alias.")
             # over_under is no longer fetched — nothing models totals, and
             # dropping it keeps the request at 2 markets instead of 3.
             game_df["over_under"] = None
