@@ -1,0 +1,93 @@
+name: NFL Weekly Bets
+
+on:
+  schedule:
+    # Tuesdays 15:30 UTC = 11:30 AM EDT (10:30 AM EST after DST ends).
+    # Always after the 10:00 ET Tuesday odds snapshot the model is graded on.
+    - cron: '30 15 * * 2'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: no odds pull, no email'
+        type: boolean
+        default: false
+      week:
+        description: 'Score this week instead of the coming one (optional)'
+        required: false
+        default: ''
+
+concurrency:
+  group: nfl-weekly
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: America/New_York
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write config from secret
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          if [ -z "$CONFIG_JSON" ]; then
+            echo "::error::Repository secret CONFIG_JSON is not set."
+            exit 1
+          fi
+          mkdir -p data
+          printf '%s' "$CONFIG_JSON" > data/config.txt
+          python - <<'PY'
+          import json, sys
+          cfg = json.load(open("data/config.txt"))
+          missing = [k for k in ("spreads", "email") if k not in cfg]
+          if missing or "key_paid" not in cfg.get("spreads", {}):
+              print(f"::error::CONFIG_JSON is missing {missing or ['spreads.key_paid']}")
+              sys.exit(1)
+          print("config written OK")
+          PY
+
+      - name: Score the week and send the email
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "${{ inputs.week }}" ]; then ARGS="$ARGS --season $(date +%Y) --week ${{ inputs.week }}"; fi
+          python nfl_weekly.py $ARGS
+
+      - name: Keep the email as a run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfl-weekly-email
+          path: logs/nfl_weekly_email.html
+          if-no-files-found: ignore
+
+      - name: Commit new odds snapshots and results
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          git add data/odds_api_nfl data/nfl_odds_snapshots.parquet data/nflverse_games.csv
+          if git diff --cached --quiet; then
+            echo "No new data to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "NFL weekly: odds snapshots and results (via workflow)"
+          git pull --rebase
+          git push

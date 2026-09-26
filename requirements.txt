@@ -10,3 +10,4 @@ requests==2.32.5
 scipy==1.15.3
 joblib==1.5.2
 matplotlib==3.10.6
+pyarrow>=15
