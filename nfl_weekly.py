@@ -42,6 +42,8 @@ ap.add_argument("--season", type=int, help="override the season (default: from t
 ap.add_argument("--week", type=int, help="override the week to score (default: the coming week)")
 ap.add_argument("--dry-run", action="store_true", help="skip the odds pull and the email; save the email HTML")
 ap.add_argument("--skip-refresh", action="store_true", help="use the cached nflverse file")
+ap.add_argument("--skip-odds", action="store_true", help="don't pull odds (use what is cached)")
+ap.add_argument("--test", action="store_true", help="prefix the subject with [TEST]")
 a = ap.parse_args()
 
 
@@ -74,7 +76,7 @@ log(f"coming week: {season} week {week}")
 
 # ---- 3. odds -------------------------------------------------------------------------------------
 odds_note = ""
-if not a.dry_run:
+if not (a.dry_run or a.skip_odds):
     cmd = [PY, "backfill_nfl_odds.py", "--seasons", *map(str, range(2020, season + 1)), "--apply"]
     out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     print(out.stdout[-2000:], out.stderr[-2000:])
@@ -220,6 +222,7 @@ n_bets = len(main_now)
 subject = (f"NFL week {week}: {n_bets} bet{'s' * (n_bets != 1)}" + (f", {sum(b['units'] for b in main_now):.1f} units" if n_bets else "")
            + (f" | last week {record(last['main'])['pnl']:+.1f}u" if last else ""))
 
+subject = ("[TEST] " if a.test else "") + subject
 Path("logs").mkdir(exist_ok=True)
 Path("logs/nfl_weekly_email.html").write_text(html, encoding="utf-8")
 log(f"subject: {subject}")
