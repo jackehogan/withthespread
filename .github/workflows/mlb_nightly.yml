@@ -35,7 +35,33 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Only run during the MLB regular season. The day after the last regular-season
+      # game still seeds and grades that final slate (no new picks); after that, and
+      # before Opening Day, the job does nothing. Manual runs always predict.
+      - name: Check MLB regular-season window
+        id: season
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import datetime, sys
+          import statsapi
+          today = datetime.date.today()
+          s = statsapi.get("season", {"sportId": 1, "seasonId": today.year})["seasons"][0]
+          start = datetime.date.fromisoformat(s["regularSeasonStartDate"])
+          end = datetime.date.fromisoformat(s["regularSeasonEndDate"])
+          if "${{ github.event_name }}" == "workflow_dispatch":
+              mode = "predict"
+          elif start <= today <= end:
+              mode = "predict"
+          elif today == end + datetime.timedelta(days=1):
+              mode = "grade"
+          else:
+              mode = "off"
+          print(f"regular season {start} to {end}; today {today} -> {mode}", file=sys.stderr)
+          print(f"mode={mode}")
+          PY
+
       - name: Write config from secret
+        if: steps.season.outputs.mode != 'off'
         env:
           CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
         run: |
@@ -52,6 +78,7 @@ jobs:
           echo "config written OK"
 
       - name: Verify MongoDB connectivity
+        if: steps.season.outputs.mode != 'off'
         run: |
           python - <<'PY'
           import sys
@@ -66,6 +93,7 @@ jobs:
           PY
 
       - name: Seed games since last stored date
+        if: steps.season.outputs.mode != 'off'
         run: |
           LAST=$(python - <<'PY'
           import datetime
@@ -91,4 +119,21 @@ jobs:
           python seed_mlb.py --seasons "$(date +%Y)" --since "$LAST"
 
       - name: Generate predictions
+        if: steps.season.outputs.mode == 'predict'
         run: python predict_mlb.py --days-ahead 0
+
+      - name: Grade the final regular-season slate
+        if: steps.season.outputs.mode == 'grade'
+        run: |
+          python - <<'PY'
+          import datetime
+          import db
+          season = datetime.date.today().year
+          client = db.connect()
+          try:
+              n = db.update_prediction_results(client, "mlb", season)
+              roi = db.fetch_roi_summary(client, "mlb", season)
+          finally:
+              client.close()
+          print(f"Graded {n} prediction(s). Final season: {roi}")
+          PY

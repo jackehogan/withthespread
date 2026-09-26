@@ -282,6 +282,9 @@ def fetch_upcoming_mlb_games(target_date: str) -> pd.DataFrame:
         status = game.get("status", "")
         if status not in ("Scheduled", "Pre-Game", "Warmup", "Preview"):
             continue  # skip postponed / in-progress / final
+        if game.get("game_type", "R") != "R":
+            continue  # regular season only: no spring training or postseason picks
+
         home = game.get("home_name", "")
         away = game.get("away_name", "")
         if not home or not away:
