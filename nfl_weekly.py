@@ -77,7 +77,7 @@ log(f"coming week: {season} week {week}")
 # ---- 3. odds -------------------------------------------------------------------------------------
 odds_note = ""
 if not (a.dry_run or a.skip_odds):
-    cmd = [PY, "backfill_nfl_odds.py", "--seasons", *map(str, range(2020, season + 1)), "--apply"]
+    cmd = [PY, "backfill_nfl_odds.py", "--seasons", *map(str, range(2020, season + 1)), "--apply", "--reserve", "1000"]
     out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     print(out.stdout[-2000:], out.stderr[-2000:])
     if out.returncode != 0:
