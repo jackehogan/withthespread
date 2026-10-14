@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+from scipy.stats import norm
 
 ET = ZoneInfo("America/New_York")
 GAMES_URL = "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv"
@@ -115,19 +116,29 @@ log(f"scored weeks: {sorted(weeks)}")
 
 
 # ---- 5. email -------------------------------------------------------------------------------------
-# Skill result: grade each bet by how far it beat or missed the spread instead of all-or-nothing.
-# Cover probability credited = 0.5 + margin / 14, capped to 0..1 (a touchdown past the spread or more
-# is a full win or loss; a miss by 0.5 is about break-even). Paid at the bet's actual price.
-# Walk-forward 2020-25 benchmark: skill ROI 15.2% vs actual ROI 20.0% (the model won more close games than it lost).
-SKILL_FULL_AT = 7.0
+# Expected vs skill. One curve links cover probability and margin past the spread:
+#   margin = 13.2 x inverse-normal(P)   <->   P = normal-cdf(margin / 13.2)
+# Expected result: stake x (P x pay - (1 - P)) with the model's P at bet time.
+# Skill result: the same formula with the P implied by the ACTUAL margin, so a game that plays out
+# exactly as projected scores exactly its expected result. Walk-forward 2020-25 benchmark:
+# actual ROI 20.0%, expected ROI 11.7%, skill ROI 8.5%.
+SIG_ATS = 13.2
+
+
+def _pay(b):
+    return 100 / -b["price"] if b["price"] < 0 else b["price"] / 100
+
+
+def exp_pnl(b):
+    p_ = b["p_cover"]
+    return b["units"] * (p_ * _pay(b) - (1 - p_))
 
 
 def skill_pnl(b):
     if b.get("ats_margin") is None:
         return 0.0
-    q = min(1.0, max(0.0, 0.5 + b["ats_margin"] / (2 * SKILL_FULL_AT)))
-    pay = 100 / -b["price"] if b["price"] < 0 else b["price"] / 100
-    return b["units"] * (q * pay - (1 - q))
+    p_ = float(norm.cdf(b["ats_margin"] / SIG_ATS))
+    return b["units"] * (p_ * _pay(b) - (1 - p_))
 
 
 def wavg(bets, key):
@@ -146,6 +157,8 @@ def record(bets):
     return {"n": len(bets), "rec": f"{w_}-{l_}" + (f"-{p_}" if p_ else ""), "staked": staked, "pnl": pnl,
             "roi": 100 * pnl / staked if staked else 0.0,
             "win": 100 * w_ / (w_ + l_) if w_ + l_ else float("nan"),  # pushes excluded
+            "exp": sum(exp_pnl(b) for b in bets),
+            "exp_roi": 100 * sum(exp_pnl(b) for b in bets) / staked if staked else float("nan"),
             "skill": sum(skill_pnl(b) for b in bets),
             "skill_roi": 100 * sum(skill_pnl(b) for b in bets) / staked if staked else float("nan"),
             "proj": wavg(bets, "proj_margin"), "actual": wavg(bets, "ats_margin")}
@@ -204,7 +217,8 @@ RESULT_COLS = [("Bet on", "bet", "left"), ("Game", "matchup", "left"), ("Price",
                ("Projected", lambda b: f"{b['proj_margin']:+.1f}", "right"),
                ("Actual vs spread", lambda b: margin_txt(b.get("ats_margin")), "right"),
                ("Result", res_cell, "left"),
-               ("Skill result", lambda b: f"{skill_pnl(b):+.1f}" if b["result"] else "", "right")]
+               ("Expected", lambda b: f"{exp_pnl(b):+.2f}", "right"),
+               ("Skill", lambda b: f"{skill_pnl(b):+.2f}" if b["result"] else "", "right")]
 
 parts = [f'<div style="font-family:Arial,sans-serif;font-size:14px;color:#222">',
          f"<h2 style='margin-bottom:4px'>NFL {season} &mdash; week {week}</h2>"]
@@ -232,7 +246,7 @@ else:
 if last:
     rm, rs = record(last["main"]), record(last["shadow"] or [])
     parts.append(f"<h3 style='margin-bottom:4px'>Last week (week {week - 1}): {rm['rec']}, {rm['pnl']:+.1f} units "
-                 f"(skill {rm['skill']:+.1f})</h3>")
+                 f"&nbsp;|&nbsp; expected {rm['exp']:+.2f}, skill {rm['skill']:+.2f}</h3>")
     parts.append(table(last["main"], RESULT_COLS))
     parts.append(f"<p style='color:#555'>Shadow model last week: {rs['rec']}, {rs['pnl']:+.1f} units</p>")
 
@@ -249,12 +263,16 @@ if rows:
         cum += r["m"]["pnl"]
         r["cum"] = cum
     parts.append(f"<h3 style='margin-bottom:4px'>Season to date: {tm['rec']}, {tm['pnl']:+.1f} units, "
-                 f"win {fmt_pct(tm['win'])}, ROI {fmt_pct(tm['roi'])} &nbsp;|&nbsp; skill ROI {fmt_pct(tm['skill_roi'])}</h3>")
+                 f"win {fmt_pct(tm['win'])}, ROI {fmt_pct(tm['roi'])} &nbsp;|&nbsp; expected ROI {fmt_pct(tm['exp_roi'])}, "
+                 f"skill ROI {fmt_pct(tm['skill_roi'])}</h3>")
     parts.append(f"<p style='margin-top:0;color:#555'>Bets were projected to beat the spread by {tm['proj']:+.1f} pts on average; "
                  f"they actually came in at {tm['actual']:+.1f} pts (stake-weighted).<br>"
-                 "ROI is pooled (total profit / total staked). Skill ROI grades each bet by how far it beat or missed the "
-                 "spread: a 0.5-pt miss is about break-even, a touchdown or more is a full win or loss.<br>"
-                 "Walk-forward 2020-25 benchmark: about 60% wins, ROI 20%, skill ROI 15%, projected +2.8 / actual +2.8 pts.</p>")
+                 "All season numbers are pooled (total / total staked). <b>Expected</b> = what the model claimed at bet time. "
+                 "<b>Skill</b> = the same claim re-scored with the cover probability implied by the actual margin past the spread "
+                 "(a bet that plays out exactly as projected scores its expected value). Compare skill with expected; "
+                 "actual ROI is the money.<br>"
+                 "Walk-forward 2020-25 benchmark: about 60% wins, ROI 20%, expected ROI 11.7%, skill ROI 8.5%, "
+                 "projected +2.8 / actual +2.8 pts.</p>")
     rows.append({"week": "<b>Season</b>", "m": tm, "s": ts, "cum": tm["pnl"], "total": True})
     B = lambda v, r: f"<b>{v}</b>" if r.get("total") else v
     parts.append(table(rows, [("Week", "week", "right"), ("Record", lambda r: B(r["m"]["rec"], r), "right"),
@@ -262,6 +280,7 @@ if rows:
                               ("Staked", lambda r: B(f"{r['m']['staked']:.1f}", r), "right"),
                               ("Profit", lambda r: B(f"{r['m']['pnl']:+.1f}", r), "right"),
                               ("ROI", lambda r: B(fmt_pct(r["m"]["roi"]) if r["m"]["staked"] else "&ndash;", r), "right"),
+                              ("Expected ROI", lambda r: B(fmt_pct(r["m"]["exp_roi"]), r), "right"),
                               ("Skill ROI", lambda r: B(fmt_pct(r["m"]["skill_roi"]), r), "right"),
                               ("Projected", lambda r: B(f"{r['m']['proj']:+.1f}", r), "right"),
                               ("Actual vs spread", lambda r: B(f"{r['m']['actual']:+.1f}", r), "right"),
