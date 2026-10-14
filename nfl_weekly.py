@@ -104,6 +104,11 @@ def score(w):
 
 weeks = {w: score(w) for w in range(2, min(week, 17) + 1)}
 weeks = {w: v for w, v in weeks.items() if v}
+# every table lists the biggest bets first
+for v in weeks.values():
+    for k in ("main", "shadow"):
+        if v.get(k):
+            v[k] = sorted(v[k], key=lambda b: -b["units"])
 this = weeks.get(week)
 last = weeks.get(week - 1)
 log(f"scored weeks: {sorted(weeks)}")
