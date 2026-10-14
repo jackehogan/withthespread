@@ -20,6 +20,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import argparse
 
 import numpy as np
+from scipy.stats import norm
 import pandas as pd
 
 ap = argparse.ArgumentParser()
@@ -96,6 +97,13 @@ reason = lambda tm, m, op, ln, ss: (f"{tm} {'won' if m > 0 else 'lost'} by {abs(
 RARITY = lambda n: "RARE (<25)" if n < 25 else ("uncommon (25-100)" if n < 100 else "common (100+)")
 
 
+# P(cover) -> projected margin past the spread: NFL results scatter ~13.2 pts around the spread
+# (walk-forward 2020-25: bets projected +2.75 pts on average, actual +2.82)
+SIG_ATS = 13.2
+proj = lambda p_: round(float(SIG_ATS * norm.ppf(p_)), 2)
+ats = lambda margin, line_bet: None if np.isnan(margin) else round(float(margin - line_bet), 1)
+
+
 def graded(margin, line_bet, stake, price):
     """(WIN/LOSS/PUSH or None if not played, units won)"""
     if np.isnan(margin):
@@ -124,7 +132,8 @@ for r in b.itertuples():
                           "price": int(r.price_bet), "units": round(float(r.stake), 2), "p_cover": round(float(r.P), 4),
                           "break_even": round(float(r.be), 4), "similar": round(float(r.similar), 1),
                           "situation": RARITY(r.similar), "reason_team": slip[-1]["reason: bet team last game"],
-                          "reason_opp": slip[-1]["reason: opponent last game"], "result": res_j, "pnl": round(pnl_j, 2)})
+                          "reason_opp": slip[-1]["reason: opponent last game"], "result": res_j, "pnl": round(pnl_j, 2),
+                          "proj_margin": proj(r.P), "ats_margin": ats(r.margin, r.line_bet)})
     rows.append({"matchup": f"{r.opp} @ {r.team}" if r.home else f"{r.team} @ {r.opp}",
                  "BET ON": f"{pick} ({r.stake:.1f}u)" if is_bet else "-",
                  "model leans": pick, "price": int(r.price_bet), "P(cover)": f"{100*r.P:.1f}%",
@@ -205,7 +214,8 @@ if not a.no_shadow:
                             "kickoff": f"{r.gameday} {r.gametime}", "price": int(r.price_bet),
                             "units": round(float(r.stake), 2), "p_cover": round(float(r.P), 4),
                             "similar": round(float(r.similar), 1), "also_main": pick in main_bets,
-                            "corrections": f"{r.adj_in:+.1f} / {r.opp_adj_in:+.1f} pts", "result": res_j, "pnl": round(pnl_j, 2)})
+                            "corrections": f"{r.adj_in:+.1f} / {r.opp_adj_in:+.1f} pts", "result": res_j, "pnl": round(pnl_j, 2),
+                            "proj_margin": proj(r.P), "ats_margin": ats(r.margin, r.line_bet)})
     print(pd.DataFrame(rows_s).to_string(index=False) if rows_s else "  no bets this week")
     if len(sb) and sb.margin.notna().any():
         s_ = sb[sb.margin.notna()]

@@ -110,6 +110,27 @@ log(f"scored weeks: {sorted(weeks)}")
 
 
 # ---- 5. email -------------------------------------------------------------------------------------
+# Skill result: grade each bet by how far it beat or missed the spread instead of all-or-nothing.
+# Cover probability credited = 0.5 + margin / 14, capped to 0..1 (a touchdown past the spread or more
+# is a full win or loss; a miss by 0.5 is about break-even). Paid at the bet's actual price.
+# Walk-forward 2020-25 benchmark: skill ROI 15.2% vs actual ROI 20.0% (the model won more close games than it lost).
+SKILL_FULL_AT = 7.0
+
+
+def skill_pnl(b):
+    if b.get("ats_margin") is None:
+        return 0.0
+    q = min(1.0, max(0.0, 0.5 + b["ats_margin"] / (2 * SKILL_FULL_AT)))
+    pay = 100 / -b["price"] if b["price"] < 0 else b["price"] / 100
+    return b["units"] * (q * pay - (1 - q))
+
+
+def wavg(bets, key):
+    w = [(b["units"], b[key]) for b in bets if b.get(key) is not None]
+    tot = sum(u for u, _ in w)
+    return sum(u * v for u, v in w) / tot if tot else float("nan")
+
+
 def record(bets):
     bets = [b for b in bets if b["result"]]
     w_ = sum(b["result"] == "WIN" for b in bets)
@@ -119,7 +140,10 @@ def record(bets):
     pnl = sum(b["pnl"] for b in bets)
     return {"n": len(bets), "rec": f"{w_}-{l_}" + (f"-{p_}" if p_ else ""), "staked": staked, "pnl": pnl,
             "roi": 100 * pnl / staked if staked else 0.0,
-            "win": 100 * w_ / (w_ + l_) if w_ + l_ else float("nan")}  # pushes excluded
+            "win": 100 * w_ / (w_ + l_) if w_ + l_ else float("nan"),  # pushes excluded
+            "skill": sum(skill_pnl(b) for b in bets),
+            "skill_roi": 100 * sum(skill_pnl(b) for b in bets) / staked if staked else float("nan"),
+            "proj": wavg(bets, "proj_margin"), "actual": wavg(bets, "ats_margin")}
 
 
 fmt_pct = lambda v: "&ndash;" if v != v else f"{v:.1f}%"
@@ -151,11 +175,19 @@ def res_cell(b):
     return f'<b style="color:{col}">{b["result"]}</b> ({b["pnl"]:+.1f})'
 
 
+def margin_txt(m):
+    if m is None:
+        return "&ndash;"
+    return "push" if m == 0 else (f"beat by {m:g}" if m > 0 else f"missed by {-m:g}")
+
+
 pct = lambda x: f"{100 * x:.1f}%"
 MAIN_COLS = [("Bet on", lambda b: f"<b>{escape(b['bet'])}</b>", "left"), ("Game", "matchup", "left"),
              ("Kickoff", "kickoff", "left"), ("Price", lambda b: f"{b['price']:+d}", "right"),
              ("Units", lambda b: f"<b>{b['units']:.1f}</b>", "right"), ("P(cover)", lambda b: pct(b["p_cover"]), "right"),
-             ("Break-even", lambda b: pct(b["break_even"]), "right"), ("Similar games", lambda b: f"{b['similar']:.0f}", "right"),
+             ("Break-even", lambda b: pct(b["break_even"]), "right"),
+             ("Projected vs spread", lambda b: f"{b['proj_margin']:+.1f}", "right"),
+             ("Similar games", lambda b: f"{b['similar']:.0f}", "right"),
              ("Situation", "situation", "left"), ("Bet team last game", "reason_team", "left"),
              ("Opponent last game", "reason_opp", "left")]
 SHADOW_COLS = [("Bet on", lambda b: f"<b>{escape(b['bet'])}</b>", "left"), ("Game", "matchup", "left"),
@@ -163,7 +195,11 @@ SHADOW_COLS = [("Bet on", lambda b: f"<b>{escape(b['bet'])}</b>", "left"), ("Gam
                ("P(cover)", lambda b: pct(b["p_cover"]), "right"), ("Similar games", lambda b: f"{b['similar']:.0f}", "right"),
                ("Corrections (us / opp)", "corrections", "left"), ("Also main bet?", lambda b: "yes" if b["also_main"] else "NO", "left")]
 RESULT_COLS = [("Bet on", "bet", "left"), ("Game", "matchup", "left"), ("Price", lambda b: f"{b['price']:+d}", "right"),
-               ("Units", lambda b: f"{b['units']:.1f}", "right"), ("Result", res_cell, "left")]
+               ("Units", lambda b: f"{b['units']:.1f}", "right"),
+               ("Projected", lambda b: f"{b['proj_margin']:+.1f}", "right"),
+               ("Actual vs spread", lambda b: margin_txt(b.get("ats_margin")), "right"),
+               ("Result", res_cell, "left"),
+               ("Skill result", lambda b: f"{skill_pnl(b):+.1f}" if b["result"] else "", "right")]
 
 parts = [f'<div style="font-family:Arial,sans-serif;font-size:14px;color:#222">',
          f"<h2 style='margin-bottom:4px'>NFL {season} &mdash; week {week}</h2>"]
@@ -190,7 +226,8 @@ else:
 
 if last:
     rm, rs = record(last["main"]), record(last["shadow"] or [])
-    parts.append(f"<h3 style='margin-bottom:4px'>Last week (week {week - 1}): {rm['rec']}, {rm['pnl']:+.1f} units</h3>")
+    parts.append(f"<h3 style='margin-bottom:4px'>Last week (week {week - 1}): {rm['rec']}, {rm['pnl']:+.1f} units "
+                 f"(skill {rm['skill']:+.1f})</h3>")
     parts.append(table(last["main"], RESULT_COLS))
     parts.append(f"<p style='color:#555'>Shadow model last week: {rs['rec']}, {rs['pnl']:+.1f} units</p>")
 
@@ -207,9 +244,12 @@ if rows:
         cum += r["m"]["pnl"]
         r["cum"] = cum
     parts.append(f"<h3 style='margin-bottom:4px'>Season to date: {tm['rec']}, {tm['pnl']:+.1f} units, "
-                 f"win {fmt_pct(tm['win'])}, ROI {fmt_pct(tm['roi'])}</h3>")
-    parts.append("<p style='margin-top:0;color:#555'>Season ROI is pooled (total profit / total staked). "
-                 "Walk-forward 2020-25 benchmark: about 60% wins, 20% ROI.</p>")
+                 f"win {fmt_pct(tm['win'])}, ROI {fmt_pct(tm['roi'])} &nbsp;|&nbsp; skill ROI {fmt_pct(tm['skill_roi'])}</h3>")
+    parts.append(f"<p style='margin-top:0;color:#555'>Bets were projected to beat the spread by {tm['proj']:+.1f} pts on average; "
+                 f"they actually came in at {tm['actual']:+.1f} pts (stake-weighted).<br>"
+                 "ROI is pooled (total profit / total staked). Skill ROI grades each bet by how far it beat or missed the "
+                 "spread: a 0.5-pt miss is about break-even, a touchdown or more is a full win or loss.<br>"
+                 "Walk-forward 2020-25 benchmark: about 60% wins, ROI 20%, skill ROI 15%, projected +2.8 / actual +2.8 pts.</p>")
     rows.append({"week": "<b>Season</b>", "m": tm, "s": ts, "cum": tm["pnl"], "total": True})
     B = lambda v, r: f"<b>{v}</b>" if r.get("total") else v
     parts.append(table(rows, [("Week", "week", "right"), ("Record", lambda r: B(r["m"]["rec"], r), "right"),
@@ -217,6 +257,9 @@ if rows:
                               ("Staked", lambda r: B(f"{r['m']['staked']:.1f}", r), "right"),
                               ("Profit", lambda r: B(f"{r['m']['pnl']:+.1f}", r), "right"),
                               ("ROI", lambda r: B(fmt_pct(r["m"]["roi"]) if r["m"]["staked"] else "&ndash;", r), "right"),
+                              ("Skill ROI", lambda r: B(fmt_pct(r["m"]["skill_roi"]), r), "right"),
+                              ("Projected", lambda r: B(f"{r['m']['proj']:+.1f}", r), "right"),
+                              ("Actual vs spread", lambda r: B(f"{r['m']['actual']:+.1f}", r), "right"),
                               ("Running total", lambda r: "" if r.get("total") else f"{r['cum']:+.1f}", "right"),
                               ("Shadow record", lambda r: B(r["s"]["rec"], r), "right"),
                               ("Shadow profit", lambda r: B(f"{r['s']['pnl']:+.1f}", r), "right"),
