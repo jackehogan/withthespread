@@ -118,7 +118,11 @@ def record(bets):
     staked = sum(b["units"] for b in bets)
     pnl = sum(b["pnl"] for b in bets)
     return {"n": len(bets), "rec": f"{w_}-{l_}" + (f"-{p_}" if p_ else ""), "staked": staked, "pnl": pnl,
-            "roi": 100 * pnl / staked if staked else 0.0}
+            "roi": 100 * pnl / staked if staked else 0.0,
+            "win": 100 * w_ / (w_ + l_) if w_ + l_ else float("nan")}  # pushes excluded
+
+
+fmt_pct = lambda v: "&ndash;" if v != v else f"{v:.1f}%"
 
 
 TD = 'style="padding:4px 8px;border-bottom:1px solid #ddd;text-align:{al};white-space:nowrap"'
@@ -202,15 +206,21 @@ if rows:
     for r in rows:
         cum += r["m"]["pnl"]
         r["cum"] = cum
-    parts.append(f"<h3 style='margin-bottom:4px'>Season to date: {tm['rec']}, {tm['pnl']:+.1f} units, ROI {tm['roi']:.1f}%</h3>")
-    parts.append(table(rows, [("Week", "week", "right"), ("Record", lambda r: r["m"]["rec"], "right"),
-                              ("Staked", lambda r: f"{r['m']['staked']:.1f}", "right"),
-                              ("Profit", lambda r: f"{r['m']['pnl']:+.1f}", "right"),
-                              ("Running total", lambda r: f"{r['cum']:+.1f}", "right"),
-                              ("Shadow record", lambda r: r["s"]["rec"], "right"),
-                              ("Shadow profit", lambda r: f"{r['s']['pnl']:+.1f}", "right")]))
-    parts.append(f"<p style='color:#555'>Shadow model season to date: {ts['rec']}, {ts['pnl']:+.1f} units, "
-                 f"ROI {ts['roi']:.1f}%</p>")
+    parts.append(f"<h3 style='margin-bottom:4px'>Season to date: {tm['rec']}, {tm['pnl']:+.1f} units, "
+                 f"win {fmt_pct(tm['win'])}, ROI {fmt_pct(tm['roi'])}</h3>")
+    parts.append("<p style='margin-top:0;color:#555'>Season ROI is pooled (total profit / total staked). "
+                 "Walk-forward 2020-25 benchmark: about 60% wins, 20% ROI.</p>")
+    rows.append({"week": "<b>Season</b>", "m": tm, "s": ts, "cum": tm["pnl"], "total": True})
+    B = lambda v, r: f"<b>{v}</b>" if r.get("total") else v
+    parts.append(table(rows, [("Week", "week", "right"), ("Record", lambda r: B(r["m"]["rec"], r), "right"),
+                              ("Win %", lambda r: B(fmt_pct(r["m"]["win"]), r), "right"),
+                              ("Staked", lambda r: B(f"{r['m']['staked']:.1f}", r), "right"),
+                              ("Profit", lambda r: B(f"{r['m']['pnl']:+.1f}", r), "right"),
+                              ("ROI", lambda r: B(fmt_pct(r["m"]["roi"]) if r["m"]["staked"] else "&ndash;", r), "right"),
+                              ("Running total", lambda r: "" if r.get("total") else f"{r['cum']:+.1f}", "right"),
+                              ("Shadow record", lambda r: B(r["s"]["rec"], r), "right"),
+                              ("Shadow profit", lambda r: B(f"{r['s']['pnl']:+.1f}", r), "right"),
+                              ("Shadow ROI", lambda r: B(fmt_pct(r["s"]["roi"]) if r["s"]["staked"] else "&ndash;", r), "right")]))
 
 cfg_model = (this or last or {})
 parts.append(f"<p style='color:#888;font-size:11px'>Model: 4-input lookup (both teams' last-game spread and spreadscore), "
