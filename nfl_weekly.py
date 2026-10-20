@@ -240,7 +240,7 @@ else:
     parts.append(table(main_now, MAIN_COLS))
     parts.append("<p style='color:#555;font-size:12px'>Similar games = past team-games that looked like this one. "
                  "2020-25: bets with under 25 similar games (RARE) went 64-26 for +161 units; the rest were about break-even.</p>")
-    parts.append("<h4 style='margin-bottom:4px'>Shadow model (not bet): n-2 correction x 0.5</h4>")
+    parts.append("<h4 style='margin-bottom:4px'>Shadow model (not bet): last game re-measured against the model's own view of it (x1)</h4>")
     parts.append(table(shadow_now, SHADOW_COLS))
 
 if last:

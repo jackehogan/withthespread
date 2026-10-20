@@ -35,7 +35,7 @@ ap.add_argument("--no-shadow", action="store_true", help="skip the shadow model 
 ap.add_argument("--json", help="also write the bets (main + shadow) to this JSON file")
 a = ap.parse_args()
 TRAIN = list(range(a.start, a.season))
-SHADOW_SCALE = 0.5
+SHADOW_SCALE = 1.0
 if a.week >= 18:
     sys.exit("week 18 is not bet (teams rest starters)")
 
@@ -159,27 +159,28 @@ if len(nb) and nb.margin.notna().any():
     print(f"graded so far: {int((cm > 0).sum())}-{int((cm < 0).sum())}, {pnl.sum():+.1f} units")
 
 # ---------------------------------------------------------------------------------------------
-# SHADOW MODEL (tracked, not bet): correct last game's line and spreadscore using game n-2.
-# The lookup's prediction for each team's previous game (walk-forward: season u from seasons < u)
-# says how wrong that game's line was likely to be; x 0.5, in points (sd_ats x inverse-normal(P)).
-# corrected line n-1 = line n-1 + adj, corrected spreadscore n-1 = spreadscore n-1 - adj, both teams.
-# Walk-forward 2020-25: +215 u vs +194 u for the main model, but the gain faded in 2024-25.
+# SHADOW MODEL (tracked, not bet): re-measure last game's surprise against the model's own view of it.
+# The lookup's prediction for each team's previous game (trained on earlier seasons) says how wrong that
+# game's line was likely to be, in points: adj = sd_ats x inverse-normal(P), x 1.0 (full strength).
+# For THIS WEEK's two teams only (history stays uncorrected):
+#   corrected line n-1 = line n-1 + adj, corrected spreadscore n-1 = spreadscore n-1 - adj.
+# Walk-forward 2019-26 (_nfl_shadow_scale.py): +272 u vs +195 for the main model, better in 6 of 8
+# seasons, profit/luck 3.6 vs 2.7; worse in 2022 and 2025.
 if not a.no_shadow:
     from scipy.stats import norm
 
-    def kernel(train, query, cols):
+    def kernel(train, query, cols, qcols=None):
         trr = train[train.r != 0]
-        zt, zq = trr[cols].to_numpy(float), query[cols].to_numpy(float)
+        zt, zq = trr[cols].to_numpy(float), query[qcols or cols].to_numpy(float)
         wid = np.array([a.c_spread, a.c_ss, a.c_spread, a.c_ss]) * zt.std(0)
         w_ = np.exp(-0.5 * (((zq[:, None, :] - zt[None, :, :]) / wid) ** 2).sum(2))
         return 0.5 * (1 + (w_ @ trr.r.to_numpy(float)) / w_.sum(1)), w_.sum(1)
 
     valid = t.ss1.notna() & t.opp_ss1.notna()
     P_game = pd.Series(0.5, index=t.index)
-    for u in range(a.start + 1, a.season + 1):
-        q = t[valid & (t.season == u) & ((t.week < a.week) | (u < a.season))]
-        if len(q):
-            P_game.loc[q.index] = kernel(t[valid & (t.season < u) & t.r.notna()], q, COLS)[0]
+    q = t[valid & (t.season == a.season) & (t.week < a.week)]          # this season's earlier games
+    if len(q):
+        P_game.loc[q.index] = kernel(t[valid & (t.season < a.season) & t.r.notna()], q, COLS)[0]
     sd_ats = (t.margin - t.exp)[t.season.isin(TRAIN)].std()
     t["adj_out"] = SHADOW_SCALE * sd_ats * norm.ppf(P_game.clip(0.01, 0.99))
     t["adj_in"] = t.groupby(["season", "team"]).adj_out.shift(1).fillna(0.0)
@@ -189,9 +190,9 @@ if not a.no_shadow:
     t["line1c"], t["ss1c"] = t.line1 + t.adj_in, t.ss1 - t.adj_in
     t["opp_line1c"], t["opp_ss1c"] = t.opp_line1 + t.opp_adj_in, t.opp_ss1 - t.opp_adj_in
     CC = ["line1c", "ss1c", "opp_line1c", "opp_ss1c"]
-    hist_c = t[t.season.isin(TRAIN) & valid & t.r.notna()]
+    hist_raw = t[t.season.isin(TRAIN) & valid & t.r.notna()]
     now_c = t[(t.season == a.season) & (t.week == a.week)].reset_index(drop=True)
-    p_c, n_c = kernel(hist_c, now_c, CC)
+    p_c, n_c = kernel(hist_raw, now_c, COLS, CC)                       # history uncorrected, this week corrected
     line_c = now_c.tue.where(now_c.tue.notna(), now_c.exp)
     price_c = np.where(now_c.tue.notna(), now_c.price.fillna(-110.0), -110.0)
     pay_c = np.where(price_c < 0, 100 / -price_c, price_c / 100)
@@ -201,7 +202,7 @@ if not a.no_shadow:
     sb = sb.sort_values(["stake", "P"], ascending=False).drop_duplicates("game_id")
     sb = sb[sb.stake >= a.min_stake]
     main_bets = {f"{r.team} {-r.line_bet:+g}" for r in b[b.stake >= a.min_stake].itertuples()}
-    print(f"\nSHADOW (not bet): n-2 correction x {SHADOW_SCALE:g}")
+    print(f"\nSHADOW (not bet): last game re-measured vs the model's view, x {SHADOW_SCALE:g}")
     rows_s, shadow_json = [], []
     for r in sb.itertuples():
         pick = f"{r.team} {-r.line_bet:+g}"
