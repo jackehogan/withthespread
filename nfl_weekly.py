@@ -289,6 +289,96 @@ if rows:
                               ("Shadow profit", lambda r: B(f"{r['s']['pnl']:+.1f}", r), "right"),
                               ("Shadow ROI", lambda r: B(fmt_pct(r["s"]["roi"]) if r["s"]["staked"] else "&ndash;", r), "right")]))
 
+# ---- teasers: 2-team, 5-point, -110 (FanDuel), underdogs at exactly +2.5 on the Tuesday line -------------
+# A +2.5 dog teased to +7.5 wins if it wins or loses by 7 or less (crosses both 3 and 7). Break-even per leg
+# at -110: 72.4%. 2022-25 these legs won 74-86% every season. Favorites and other spreads were inconsistent.
+TEASE, T_PAY, T_BE = 5.0, 100 / 110, 72.4
+fd_tue = o[(o.role == "tuesday") & (o.market == "spreads") & (o.book == "fanduel")].groupby("game_id").home_point.first()
+main_teams = {b["bet"].split()[0] for b in main_now}
+
+
+def teaser_week(w):
+    gw = g[(g.season == season) & (g.week == w)].sort_values(["gameday", "gametime", "game_id"])
+    legs = []
+    for r in gw.itertuples():
+        hp = fd_tue.get(r.game_id)
+        if hp is None or abs(hp) != 2.5:
+            continue
+        dog_home = hp < 0                                      # home_point: + = home favored
+        team, opp = (r.home_team, r.away_team) if dog_home else (r.away_team, r.home_team)
+        margin = None if pd.isna(r.result) else float(r.result if dog_home else -r.result)
+        legs.append({"leg": f"{team} +2.5 &rarr; +7.5", "team": team,
+                     "game": f"{r.away_team} @ {r.home_team}", "kickoff": f"{r.gameday} {r.gametime}",
+                     "margin": margin, "result": None if margin is None else ("WIN" if margin + 2.5 + TEASE > 0 else "LOSS")})
+    pairs = [legs[i:i + 2] for i in range(0, len(legs) - 1, 2)]
+    for p in pairs:
+        rs = [x["result"] for x in p]
+        p_res = "LOSS" if "LOSS" in rs else (None if None in rs else "WIN")
+        for x in p:
+            x["teaser_result"] = p_res
+    return legs, pairs
+
+
+def teaser_record(pairs):
+    done = [p for p in pairs if p[0].get("teaser_result")]
+    w_ = sum(p[0]["teaser_result"] == "WIN" for p in done)
+    return w_, len(done) - w_, w_ * T_PAY - (len(done) - w_)
+
+
+def leg_cell(x):
+    if not x["result"]:
+        return "pending"
+    col = "#1a7f37" if x["result"] == "WIN" else "#c62828"
+    m = x["margin"]
+    how = f"won by {m:g}" if m > 0 else ("tied" if m == 0 else f"lost by {-m:g}")
+    return f'<b style="color:{col}">{x["result"]}</b> ({x["team"]} {how})'
+
+
+parts.append("<h3 style='margin-bottom:4px'>Teasers: 2-team, 5-point at -110, underdogs at exactly +2.5</h3>")
+parts.append("<p style='margin-top:0;color:#555'>Each +2.5 underdog is teased to +7.5: the leg wins if the team wins or loses by "
+             "7 or less. <b>Only bet a leg if it is still exactly +2.5 when you place it.</b> Separate from the model "
+             f"(1 unit per teaser). Break-even per leg {T_BE}%; 2022-25 these legs won 74-86% every season.</p>")
+legs_now, pairs_now = teaser_week(week)
+if len(legs_now) < 2:
+    parts.append(f"<p><i>{'Only one' if legs_now else 'No'} +2.5 underdog on FanDuel's Tuesday lines this week - no teaser.</i></p>")
+else:
+    rows_t = [{**x, "n": f"Teaser {i + 1}"} for i, p in enumerate(pairs_now) for x in p]
+    if len(legs_now) % 2:
+        rows_t.append({**legs_now[-1], "n": "spare (no partner)"})
+    parts.append(table(rows_t, [("", "n", "left"), ("Leg", lambda x: f"<b>{x['leg']}</b>", "left"), ("Game", "game", "left"),
+                                ("Kickoff", "kickoff", "left"),
+                                ("Model also bets this team?", lambda x: "yes" if x["team"] in main_teams else "", "left")]))
+t_rows, all_pairs, all_legs = [], [], []
+for w in range(1, week + 1):
+    lw, pw = teaser_week(w)
+    all_pairs += pw
+    all_legs += [x for x in lw if x["result"]]
+    tw, tl, tp = teaser_record(pw)
+    lw_done = [x for x in lw if x["result"]]
+    if lw_done:
+        t_rows.append({"week": w, "legs": f"{sum(x['result'] == 'WIN' for x in lw_done)}-{sum(x['result'] == 'LOSS' for x in lw_done)}",
+                       "teasers": f"{tw}-{tl}" if tw + tl else "&ndash;", "profit": tp})
+if week > 1:
+    lw_, pw_ = teaser_week(week - 1)
+    if pw_:
+        parts.append(f"<p style='margin-bottom:2px'><b>Last week's teasers (week {week - 1}):</b></p>")
+        parts.append(table([{**x, "n": f"Teaser {i + 1}"} for i, p in enumerate(pw_) for x in p],
+                           [("", "n", "left"), ("Leg", "leg", "left"), ("Game", "game", "left"), ("Leg result", leg_cell, "left"),
+                            ("Teaser", lambda x: x.get("teaser_result") or "pending", "left")]))
+if t_rows:
+    tw, tl, tp = teaser_record(all_pairs)
+    lw_n = sum(x["result"] == "WIN" for x in all_legs)
+    leg_pct = 100 * lw_n / len(all_legs)
+    parts.append(f"<p style='margin-bottom:2px'><b>Teasers season to date:</b> teasers {tw}-{tl}, {tp:+.1f} units"
+                 f"{f', ROI {100 * tp / (tw + tl):+.1f}%' if tw + tl else ''} &nbsp;|&nbsp; legs {lw_n}-{len(all_legs) - lw_n} "
+                 f"({leg_pct:.1f}% vs {T_BE}% break-even)</p>")
+    cum = 0.0
+    for r in t_rows:
+        cum += r["profit"]
+        r["cum"] = cum
+    parts.append(table(t_rows, [("Week", "week", "right"), ("Legs W-L", "legs", "right"), ("Teasers W-L", "teasers", "right"),
+                                ("Profit", lambda r: f"{r['profit']:+.1f}", "right"), ("Running total", lambda r: f"{r['cum']:+.1f}", "right")]))
+
 cfg_model = (this or last or {})
 parts.append(f"<p style='color:#888;font-size:11px'>Model: 4-input lookup (both teams' last-game spread and spreadscore), "
              f"trained {cfg_model.get('train', '')}, widths {cfg_model.get('widths', '')}. "
@@ -297,6 +387,7 @@ html = "\n".join(parts)
 
 n_bets = len(main_now)
 subject = (f"NFL week {week}: {n_bets} bet{'s' * (n_bets != 1)}" + (f", {sum(b['units'] for b in main_now):.1f} units" if n_bets else "")
+           + (f" + {len(pairs_now)} teaser{'s' * (len(pairs_now) != 1)}" if pairs_now else "")
            + (f" | last week {record(last['main'])['pnl']:+.1f}u" if last else ""))
 
 subject = ("[TEST] " if a.test else "") + subject
